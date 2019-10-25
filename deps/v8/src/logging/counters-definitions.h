@@ -94,7 +94,10 @@ namespace internal {
   /* bailout reason if Liftoff failed, or {kSuccess} (per function) */         \
   HR(liftoff_bailout_reasons, V8.LiftoffBailoutReasons, 0, 20, 21)             \
   /* Ticks observed in a single Turbofan compilation, in 1K */                 \
-  HR(turbofan_ticks, V8.TurboFan1KTicks, 0, 100000, 200)
+  HR(turbofan_ticks, V8.TurboFan1KTicks, 0, 100000, 200)                       \
+  /* Backtracks observed in a single regexp interpreter execution */           \
+  /* The maximum of 100M backtracks takes roughly 2 seconds on my machine. */  \
+  HR(regexp_backtracks, V8.RegExpBacktracks, 1, 100000000, 50)
 
 #define HISTOGRAM_TIMER_LIST(HT)                                               \
   /* Timer histograms, not thread safe: HT(name, caption, max, unit) */        \
@@ -221,6 +224,8 @@ namespace internal {
      MICROSECOND)                                                              \
   HT(compile_script_no_cache_because_cache_too_cold,                           \
      V8.CompileScriptMicroSeconds.NoCache.CacheTooCold, 1000000, MICROSECOND)  \
+  HT(compile_script_streaming_finalization,                                    \
+     V8.CompileScriptMicroSeconds.StreamingFinalization, 1000000, MICROSECOND) \
   HT(compile_script_on_background,                                             \
      V8.CompileScriptMicroSeconds.BackgroundThread, 1000000, MICROSECOND)      \
   HT(compile_function_on_background,                                           \

@@ -326,7 +326,6 @@ void TurboAssembler::CallBuiltinByIndex(Register builtin_index) {
 
 void TurboAssembler::CallBuiltin(int builtin_index, Condition cond) {
   DCHECK(Builtins::IsBuiltinId(builtin_index));
-  DCHECK(FLAG_embedded_builtins);
   RecordCommentForOffHeapTrampoline(builtin_index);
   EmbeddedData d = EmbeddedData::FromBlob();
   Address entry = d.InstructionStartOfBuiltin(builtin_index);
@@ -447,21 +446,23 @@ void TurboAssembler::Push(Smi smi) {
 void TurboAssembler::Move(Register dst, Smi smi) { mov(dst, Operand(smi)); }
 
 void TurboAssembler::Move(Register dst, Handle<HeapObject> value) {
-  if (FLAG_embedded_builtins) {
-    if (root_array_available_ && options().isolate_independent_code) {
-      IndirectLoadConstant(dst, value);
-      return;
-    }
+  // TODO(jgruber,v8:8887): Also consider a root-relative load when generating
+  // non-isolate-independent code. In many cases it might be cheaper than
+  // embedding the relocatable value.
+  if (root_array_available_ && options().isolate_independent_code) {
+    IndirectLoadConstant(dst, value);
+    return;
   }
   mov(dst, Operand(value));
 }
 
 void TurboAssembler::Move(Register dst, ExternalReference reference) {
-  if (FLAG_embedded_builtins) {
-    if (root_array_available_ && options().isolate_independent_code) {
-      IndirectLoadExternalReference(dst, reference);
-      return;
-    }
+  // TODO(jgruber,v8:8887): Also consider a root-relative load when generating
+  // non-isolate-independent code. In many cases it might be cheaper than
+  // embedding the relocatable value.
+  if (root_array_available_ && options().isolate_independent_code) {
+    IndirectLoadExternalReference(dst, reference);
+    return;
   }
   mov(dst, Operand(reference));
 }
@@ -573,7 +574,7 @@ void MacroAssembler::Ubfx(Register dst, Register src1, int lsb, int width,
                           Condition cond) {
   DCHECK_LT(lsb, 32);
   if (!CpuFeatures::IsSupported(ARMv7) || predictable_code_size()) {
-    int mask = (1 << (width + lsb)) - 1 - ((1 << lsb) - 1);
+    int mask = (1u << (width + lsb)) - 1u - ((1u << lsb) - 1u);
     and_(dst, src1, Operand(mask), LeaveCC, cond);
     if (lsb != 0) {
       mov(dst, Operand(dst, LSR, lsb), LeaveCC, cond);
@@ -1125,6 +1126,12 @@ void TurboAssembler::ExtractLane(SwVfpRegister dst, QwNeonRegister src,
   VmovExtended(dst.code(), s_code);
 }
 
+void TurboAssembler::ExtractLane(DwVfpRegister dst, QwNeonRegister src,
+                                 int lane) {
+  DwVfpRegister double_dst = DwVfpRegister::from_code(src.code() * 2 + lane);
+  vmov(dst, double_dst);
+}
+
 void TurboAssembler::ReplaceLane(QwNeonRegister dst, QwNeonRegister src,
                                  Register src_lane, NeonDataType dt, int lane) {
   Move(dst, src);
@@ -1143,6 +1150,13 @@ void TurboAssembler::ReplaceLane(QwNeonRegister dst, QwNeonRegister src,
   Move(dst, src);
   int s_code = dst.code() * 4 + lane;
   VmovExtended(s_code, src_lane.code());
+}
+
+void TurboAssembler::ReplaceLane(QwNeonRegister dst, QwNeonRegister src,
+                                 DwVfpRegister src_lane, int lane) {
+  Move(dst, src);
+  DwVfpRegister double_dst = DwVfpRegister::from_code(dst.code() * 2 + lane);
+  vmov(double_dst, src_lane);
 }
 
 void TurboAssembler::LslPair(Register dst_low, Register dst_high,
@@ -1602,57 +1616,43 @@ void MacroAssembler::InvokePrologue(const ParameterCount& expected,
   }
 }
 
-void MacroAssembler::CheckDebugHook(Register fun, Register new_target,
-                                    const ParameterCount& expected,
-                                    const ParameterCount& actual) {
-  Label skip_hook;
-
-  ExternalReference debug_hook_active =
-      ExternalReference::debug_hook_on_function_call_address(isolate());
-  Move(r4, debug_hook_active);
-  ldrsb(r4, MemOperand(r4));
-  cmp(r4, Operand(0));
-  b(eq, &skip_hook);
-
-  {
-    // Load receiver to pass it later to DebugOnFunctionCall hook.
-    if (actual.is_reg()) {
-      mov(r4, actual.reg());
-    } else {
-      mov(r4, Operand(actual.immediate()));
-    }
-    ldr(r4, MemOperand(sp, r4, LSL, kPointerSizeLog2));
-    FrameScope frame(this,
-                     has_frame() ? StackFrame::NONE : StackFrame::INTERNAL);
-    if (expected.is_reg()) {
-      SmiTag(expected.reg());
-      Push(expected.reg());
-    }
-    if (actual.is_reg()) {
-      SmiTag(actual.reg());
-      Push(actual.reg());
-    }
-    if (new_target.is_valid()) {
-      Push(new_target);
-    }
-    Push(fun);
-    Push(fun);
-    Push(r4);
-    CallRuntime(Runtime::kDebugOnFunctionCall);
-    Pop(fun);
-    if (new_target.is_valid()) {
-      Pop(new_target);
-    }
-    if (actual.is_reg()) {
-      Pop(actual.reg());
-      SmiUntag(actual.reg());
-    }
-    if (expected.is_reg()) {
-      Pop(expected.reg());
-      SmiUntag(expected.reg());
-    }
+void MacroAssembler::CallDebugOnFunctionCall(Register fun, Register new_target,
+                                             const ParameterCount& expected,
+                                             const ParameterCount& actual) {
+  // Load receiver to pass it later to DebugOnFunctionCall hook.
+  if (actual.is_reg()) {
+    ldr(r4, MemOperand(sp, actual.reg(), LSL, kPointerSizeLog2));
+  } else {
+    ldr(r4, MemOperand(sp, actual.immediate() << kPointerSizeLog2));
   }
-  bind(&skip_hook);
+  FrameScope frame(this, has_frame() ? StackFrame::NONE : StackFrame::INTERNAL);
+  if (expected.is_reg()) {
+    SmiTag(expected.reg());
+    Push(expected.reg());
+  }
+  if (actual.is_reg()) {
+    SmiTag(actual.reg());
+    Push(actual.reg());
+  }
+  if (new_target.is_valid()) {
+    Push(new_target);
+  }
+  Push(fun);
+  Push(fun);
+  Push(r4);
+  CallRuntime(Runtime::kDebugOnFunctionCall);
+  Pop(fun);
+  if (new_target.is_valid()) {
+    Pop(new_target);
+  }
+  if (actual.is_reg()) {
+    Pop(actual.reg());
+    SmiUntag(actual.reg());
+  }
+  if (expected.is_reg()) {
+    Pop(expected.reg());
+    SmiUntag(expected.reg());
+  }
 }
 
 void MacroAssembler::InvokeFunctionCode(Register function, Register new_target,
@@ -1665,7 +1665,16 @@ void MacroAssembler::InvokeFunctionCode(Register function, Register new_target,
   DCHECK_IMPLIES(new_target.is_valid(), new_target == r3);
 
   // On function call, call into the debugger if necessary.
-  CheckDebugHook(function, new_target, expected, actual);
+  Label debug_hook, continue_after_hook;
+  {
+    ExternalReference debug_hook_active =
+        ExternalReference::debug_hook_on_function_call_address(isolate());
+    Move(r4, debug_hook_active);
+    ldrsb(r4, MemOperand(r4));
+    cmp(r4, Operand(0));
+    b(ne, &debug_hook);
+  }
+  bind(&continue_after_hook);
 
   // Clear the new.target register if not given.
   if (!new_target.is_valid()) {
@@ -1687,11 +1696,17 @@ void MacroAssembler::InvokeFunctionCode(Register function, Register new_target,
       DCHECK(flag == JUMP_FUNCTION);
       JumpCodeObject(code);
     }
-
-    // Continue here if InvokePrologue does handle the invocation due to
-    // mismatched parameter counts.
-    bind(&done);
   }
+  b(&done);
+
+  // Deferred debug hook.
+  bind(&debug_hook);
+  CallDebugOnFunctionCall(function, new_target, expected, actual);
+  b(&continue_after_hook);
+
+  // Continue here if InvokePrologue does handle the invocation due to
+  // mismatched parameter counts.
+  bind(&done);
 }
 
 void MacroAssembler::InvokeFunction(Register fun, Register new_target,
@@ -1774,7 +1789,7 @@ void MacroAssembler::CompareObjectType(Register object, Register map,
   UseScratchRegisterScope temps(this);
   const Register temp = type_reg == no_reg ? temps.Acquire() : type_reg;
 
-  ldr(map, FieldMemOperand(object, HeapObject::kMapOffset));
+  LoadMap(map, object);
   CompareInstanceType(map, temp, type);
 }
 
@@ -2009,13 +2024,19 @@ void TurboAssembler::Abort(AbortReason reason) {
   // will not return here
 }
 
+void MacroAssembler::LoadMap(Register destination, Register object) {
+  ldr(destination, FieldMemOperand(object, HeapObject::kMapOffset));
+}
+
 void MacroAssembler::LoadGlobalProxy(Register dst) {
   LoadNativeContextSlot(Context::GLOBAL_PROXY_INDEX, dst);
 }
 
 void MacroAssembler::LoadNativeContextSlot(int index, Register dst) {
-  ldr(dst, NativeContextMemOperand());
-  ldr(dst, ContextMemOperand(dst, index));
+  LoadMap(dst, cp);
+  ldr(dst, FieldMemOperand(
+               dst, Map::kConstructorOrBackPointerOrNativeContextOffset));
+  ldr(dst, MemOperand(dst, Context::SlotOffset(index)));
 }
 
 void TurboAssembler::InitializeRootRegister() {
@@ -2077,7 +2098,7 @@ void MacroAssembler::AssertConstructor(Register object) {
     tst(object, Operand(kSmiTagMask));
     Check(ne, AbortReason::kOperandIsASmiAndNotAConstructor);
     push(object);
-    ldr(object, FieldMemOperand(object, HeapObject::kMapOffset));
+    LoadMap(object, object);
     ldrb(object, FieldMemOperand(object, Map::kBitFieldOffset));
     tst(object, Operand(Map::IsConstructorBit::kMask));
     pop(object);
@@ -2117,7 +2138,7 @@ void MacroAssembler::AssertGeneratorObject(Register object) {
   // Load map
   Register map = object;
   push(object);
-  ldr(map, FieldMemOperand(object, HeapObject::kMapOffset));
+  LoadMap(map, object);
 
   // Check if JSGeneratorObject
   Label do_check;
@@ -2145,7 +2166,7 @@ void MacroAssembler::AssertUndefinedOrAllocationSite(Register object,
     AssertNotSmi(object);
     CompareRoot(object, RootIndex::kUndefinedValue);
     b(eq, &done_checking);
-    ldr(scratch, FieldMemOperand(object, HeapObject::kMapOffset));
+    LoadMap(scratch, object);
     CompareInstanceType(scratch, scratch, ALLOCATION_SITE_TYPE);
     Assert(eq, AbortReason::kExpectedUndefinedOrCell);
     bind(&done_checking);

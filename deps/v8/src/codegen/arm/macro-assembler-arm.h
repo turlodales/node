@@ -440,10 +440,13 @@ class V8_EXPORT_PRIVATE TurboAssembler : public TurboAssemblerBase {
   void ExtractLane(Register dst, QwNeonRegister src, NeonDataType dt, int lane);
   void ExtractLane(Register dst, DwVfpRegister src, NeonDataType dt, int lane);
   void ExtractLane(SwVfpRegister dst, QwNeonRegister src, int lane);
+  void ExtractLane(DwVfpRegister dst, QwNeonRegister src, int lane);
   void ReplaceLane(QwNeonRegister dst, QwNeonRegister src, Register src_lane,
                    NeonDataType dt, int lane);
   void ReplaceLane(QwNeonRegister dst, QwNeonRegister src,
                    SwVfpRegister src_lane, int lane);
+  void ReplaceLane(QwNeonRegister dst, QwNeonRegister src,
+                   DwVfpRegister src_lane, int lane);
 
   // Register move. May do nothing if the registers are identical.
   void Move(Register dst, Smi smi);
@@ -620,6 +623,8 @@ class V8_EXPORT_PRIVATE MacroAssembler : public TurboAssembler {
   void LeaveExitFrame(bool save_doubles, Register argument_count,
                       bool argument_count_is_length = false);
 
+  void LoadMap(Register destination, Register object);
+
   // Load the global proxy from the current context.
   void LoadGlobalProxy(Register dst);
 
@@ -633,10 +638,10 @@ class V8_EXPORT_PRIVATE MacroAssembler : public TurboAssembler {
                           const ParameterCount& expected,
                           const ParameterCount& actual, InvokeFlag flag);
 
-  // On function call, call into the debugger if necessary.
-  void CheckDebugHook(Register fun, Register new_target,
-                      const ParameterCount& expected,
-                      const ParameterCount& actual);
+  // On function call, call into the debugger.
+  void CallDebugOnFunctionCall(Register fun, Register new_target,
+                               const ParameterCount& expected,
+                               const ParameterCount& actual);
 
   // Invoke the JavaScript function in the given register. Changes the
   // current context to the context in the function before invoking.
@@ -804,17 +809,6 @@ class V8_EXPORT_PRIVATE MacroAssembler : public TurboAssembler {
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(MacroAssembler);
 };
-
-// -----------------------------------------------------------------------------
-// Static helper functions.
-
-inline MemOperand ContextMemOperand(Register context, int index = 0) {
-  return MemOperand(context, Context::SlotOffset(index));
-}
-
-inline MemOperand NativeContextMemOperand() {
-  return ContextMemOperand(cp, Context::NATIVE_CONTEXT_INDEX);
-}
 
 #define ACCESS_MASM(masm) masm->
 

@@ -160,10 +160,6 @@ bool NewSpace::ToSpaceContainsSlow(Address a) {
 bool NewSpace::ToSpaceContains(Object o) { return to_space_.Contains(o); }
 bool NewSpace::FromSpaceContains(Object o) { return from_space_.Contains(o); }
 
-bool PagedSpace::Contains(Address addr) {
-  return MemoryChunk::FromAnyPointerAddress(addr)->owner() == this;
-}
-
 bool PagedSpace::Contains(Object o) {
   if (!o.IsHeapObject()) return false;
   return Page::FromAddress(o.ptr())->owner() == this;
@@ -199,13 +195,6 @@ bool PagedSpace::TryFreeLast(HeapObject object, int object_size) {
     }
   }
   return false;
-}
-
-MemoryChunk* MemoryChunk::FromAnyPointerAddress(Address addr) {
-  while (!HasHeaderSentinel(addr)) {
-    addr = BaseAddress(addr) - 1;
-  }
-  return FromAddress(addr);
 }
 
 void MemoryChunk::IncrementExternalBackingStoreBytes(
@@ -480,7 +469,7 @@ AllocationResult PagedSpace::AllocateRaw(int size_in_bytes,
   AllocationResult result = AllocateRawUnaligned(size_in_bytes, origin);
 #endif
   HeapObject heap_obj;
-  if (!result.IsRetry() && result.To(&heap_obj) && !is_local()) {
+  if (!result.IsRetry() && result.To(&heap_obj) && !is_local_space()) {
     AllocationStep(static_cast<int>(size_in_bytes + bytes_since_last),
                    heap_obj.address(), size_in_bytes);
     StartNextInlineAllocationStep();

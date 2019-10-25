@@ -24,7 +24,7 @@
 #include "src/objects/literal-objects-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/smi.h"
-#include "src/objects/template-objects-inl.h"
+#include "src/objects/template-objects.h"
 
 namespace v8 {
 namespace internal {
@@ -215,6 +215,9 @@ class BytecodeGraphBuilder {
                                                             FeedbackSlot slot);
   JSTypeHintLowering::LoweringResult TryBuildSimplifiedConstruct(
       const Operator* op, Node* const* args, int arg_count, FeedbackSlot slot);
+  JSTypeHintLowering::LoweringResult TryBuildSimplifiedGetIterator(
+      const Operator* op, Node* receiver, FeedbackSlot load_slot,
+      FeedbackSlot call_slot);
   JSTypeHintLowering::LoweringResult TryBuildSimplifiedLoadNamed(
       const Operator* op, Node* receiver, FeedbackSlot slot);
   JSTypeHintLowering::LoweringResult TryBuildSimplifiedLoadKeyed(
@@ -945,7 +948,7 @@ BytecodeGraphBuilder::BytecodeGraphBuilder(
           bytecode_array().parameter_count(), bytecode_array().register_count(),
           shared_info.object())),
       bytecode_iterator_(
-          base::make_unique<OffHeapBytecodeArray>(bytecode_array())),
+          std::make_unique<OffHeapBytecodeArray>(bytecode_array())),
       bytecode_analysis_(broker_->GetBytecodeAnalysis(
           bytecode_array().object(), osr_offset,
           flags & BytecodeGraphBuilderFlag::kAnalyzeEnvironmentLiveness,
@@ -971,12 +974,12 @@ BytecodeGraphBuilder::BytecodeGraphBuilder(
   if (FLAG_concurrent_inlining) {
     // With concurrent inlining on, the source position address doesn't change
     // because it's been copied from the heap.
-    source_position_iterator_ = base::make_unique<SourcePositionTableIterator>(
+    source_position_iterator_ = std::make_unique<SourcePositionTableIterator>(
         Vector<const byte>(bytecode_array().source_positions_address(),
                            bytecode_array().source_positions_size()));
   } else {
     // Otherwise, we need to access the table through a handle.
-    source_position_iterator_ = base::make_unique<SourcePositionTableIterator>(
+    source_position_iterator_ = std::make_unique<SourcePositionTableIterator>(
         handle(bytecode_array().object()->SourcePositionTableIfCollected(),
                isolate()));
   }
@@ -1570,31 +1573,44 @@ BytecodeGraphBuilder::Environment* BytecodeGraphBuilder::CheckContextExtensions(
   // We only need to check up to the last-but-one depth, because the an eval
   // in the same scope as the variable itself has no way of shadowing it.
   for (uint32_t d = 0; d < depth; d++) {
-    Node* extension_slot =
-        NewNode(javascript()->LoadContext(d, Context::EXTENSION_INDEX, false));
+    Node* has_extension = NewNode(javascript()->HasContextExtension(d));
 
-    Node* check_no_extension =
-        NewNode(simplified()->ReferenceEqual(), extension_slot,
-                jsgraph()->TheHoleConstant());
-
-    NewBranch(check_no_extension);
-
+    Environment* undefined_extension_env;
+    NewBranch(has_extension);
     {
       SubEnvironment sub_environment(this);
+      NewIfTrue();
 
-      NewIfFalse();
-      // If there is an extension, merge into the slow path.
-      if (slow_environment == nullptr) {
-        slow_environment = environment();
-        NewMerge();
-      } else {
-        slow_environment->Merge(environment(),
-                                bytecode_analysis().GetInLivenessFor(
-                                    bytecode_iterator().current_offset()));
+      Node* extension_slot = NewNode(
+          javascript()->LoadContext(d, Context::EXTENSION_INDEX, false));
+
+      Node* check_no_extension =
+          NewNode(simplified()->ReferenceEqual(), extension_slot,
+                  jsgraph()->UndefinedConstant());
+
+      NewBranch(check_no_extension);
+      {
+        SubEnvironment sub_environment(this);
+
+        NewIfFalse();
+        // If there is an extension, merge into the slow path.
+        if (slow_environment == nullptr) {
+          slow_environment = environment();
+          NewMerge();
+        } else {
+          slow_environment->Merge(environment(),
+                                  bytecode_analysis().GetInLivenessFor(
+                                      bytecode_iterator().current_offset()));
+        }
       }
+      NewIfTrue();
+      undefined_extension_env = environment();
     }
-
-    NewIfTrue();
+    NewIfFalse();
+    environment()->Merge(undefined_extension_env,
+                         bytecode_analysis().GetInLivenessFor(
+                             bytecode_iterator().current_offset()));
+    mark_as_needing_eager_checkpoint(true);
     // Do nothing on if there is no extension, eventually falling through to
     // the fast path.
   }
@@ -2087,12 +2103,13 @@ void BytecodeGraphBuilder::VisitCloneObject() {
 
 void BytecodeGraphBuilder::VisitGetTemplateObject() {
   DisallowHeapAccessIf no_heap_access(FLAG_concurrent_inlining);
-  FeedbackSlot slot = bytecode_iterator().GetSlotOperand(1);
-  ObjectRef description(
+  FeedbackSource source =
+      CreateFeedbackSource(bytecode_iterator().GetIndexOperand(1));
+  TemplateObjectDescriptionRef description(
       broker(), bytecode_iterator().GetConstantForIndexOperand(0, isolate()));
-  JSArrayRef template_object =
-      shared_info().GetTemplateObject(description, feedback_vector(), slot);
-  environment()->BindAccumulator(jsgraph()->Constant(template_object));
+  Node* template_object = NewNode(javascript()->GetTemplateObject(
+      description.object(), shared_info().object(), source));
+  environment()->BindAccumulator(template_object);
 }
 
 Node* const* BytecodeGraphBuilder::GetCallArgumentsFromRegisters(
@@ -3297,19 +3314,21 @@ void BytecodeGraphBuilder::VisitForInStep() {
 
 void BytecodeGraphBuilder::VisitGetIterator() {
   PrepareEagerCheckpoint();
-  Node* object =
+  Node* receiver =
       environment()->LookupRegister(bytecode_iterator().GetRegisterOperand(0));
-  FeedbackSource feedback =
+  FeedbackSource load_feedback =
       CreateFeedbackSource(bytecode_iterator().GetIndexOperand(1));
-  const Operator* op = javascript()->GetIterator(feedback);
+  FeedbackSource call_feedback =
+      CreateFeedbackSource(bytecode_iterator().GetIndexOperand(2));
+  const Operator* op = javascript()->GetIterator(load_feedback, call_feedback);
 
-  JSTypeHintLowering::LoweringResult lowering =
-      TryBuildSimplifiedLoadNamed(op, object, feedback.slot);
+  JSTypeHintLowering::LoweringResult lowering = TryBuildSimplifiedGetIterator(
+      op, receiver, load_feedback.slot, call_feedback.slot);
   if (lowering.IsExit()) return;
 
   DCHECK(!lowering.Changed());
-  Node* node = NewNode(op, object);
-  environment()->BindAccumulator(node, Environment::kAttachFrameState);
+  Node* iterator = NewNode(op, receiver);
+  environment()->BindAccumulator(iterator, Environment::kAttachFrameState);
 }
 
 void BytecodeGraphBuilder::VisitSuspendGenerator() {
@@ -3773,6 +3792,20 @@ BytecodeGraphBuilder::TryBuildSimplifiedConstruct(const Operator* op,
                                                     control, slot);
   ApplyEarlyReduction(result);
   return result;
+}
+
+JSTypeHintLowering::LoweringResult
+BytecodeGraphBuilder::TryBuildSimplifiedGetIterator(const Operator* op,
+                                                    Node* receiver,
+                                                    FeedbackSlot load_slot,
+                                                    FeedbackSlot call_slot) {
+  Node* effect = environment()->GetEffectDependency();
+  Node* control = environment()->GetControlDependency();
+  JSTypeHintLowering::LoweringResult early_reduction =
+      type_hint_lowering().ReduceGetIteratorOperation(
+          op, receiver, effect, control, load_slot, call_slot);
+  ApplyEarlyReduction(early_reduction);
+  return early_reduction;
 }
 
 JSTypeHintLowering::LoweringResult

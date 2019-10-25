@@ -103,6 +103,8 @@ class V8_EXPORT_PRIVATE TurboAssembler : public TurboAssemblerBase {
 
   void Jump(Handle<Code> code_object, RelocInfo::Mode rmode);
 
+  void LoadMap(Register destination, Register object);
+
   void RetpolineJump(Register reg);
 
   void CallForDeoptimization(Address target, int deopt_id);
@@ -237,6 +239,7 @@ class V8_EXPORT_PRIVATE TurboAssembler : public TurboAssemblerBase {
   void Pshufd(XMMRegister dst, Operand src, uint8_t shuffle);
   void Psraw(XMMRegister dst, uint8_t shift);
   void Psrlw(XMMRegister dst, uint8_t shift);
+  void Psrlq(XMMRegister dst, uint8_t shift);
 
 // SSE/SSE2 instructions with AVX version.
 #define AVX_OP2_WITH_TYPE(macro_name, name, dst_type, src_type) \
@@ -258,6 +261,9 @@ class V8_EXPORT_PRIVATE TurboAssembler : public TurboAssemblerBase {
   AVX_OP2_WITH_TYPE(Movd, movd, Register, XMMRegister)
   AVX_OP2_WITH_TYPE(Movd, movd, Operand, XMMRegister)
   AVX_OP2_WITH_TYPE(Cvtdq2ps, cvtdq2ps, XMMRegister, Operand)
+  AVX_OP2_WITH_TYPE(Sqrtpd, sqrtpd, XMMRegister, const Operand&)
+  AVX_OP2_WITH_TYPE(Movapd, movapd, XMMRegister, XMMRegister)
+  AVX_OP2_WITH_TYPE(Movapd, movapd, XMMRegister, const Operand&)
 
 #undef AVX_OP2_WITH_TYPE
 
@@ -278,12 +284,14 @@ class V8_EXPORT_PRIVATE TurboAssembler : public TurboAssemblerBase {
 
   AVX_OP3_XO(Packsswb, packsswb)
   AVX_OP3_XO(Packuswb, packuswb)
+  AVX_OP3_XO(Paddusb, paddusb)
   AVX_OP3_XO(Pcmpeqb, pcmpeqb)
   AVX_OP3_XO(Pcmpeqw, pcmpeqw)
   AVX_OP3_XO(Pcmpeqd, pcmpeqd)
   AVX_OP3_XO(Psubb, psubb)
   AVX_OP3_XO(Psubw, psubw)
   AVX_OP3_XO(Psubd, psubd)
+  AVX_OP3_XO(Psubq, psubq)
   AVX_OP3_XO(Punpcklbw, punpcklbw)
   AVX_OP3_XO(Punpckhbw, punpckhbw)
   AVX_OP3_XO(Pxor, pxor)
@@ -294,9 +302,40 @@ class V8_EXPORT_PRIVATE TurboAssembler : public TurboAssemblerBase {
   AVX_OP3_XO(Xorpd, xorpd)
   AVX_OP3_XO(Sqrtss, sqrtss)
   AVX_OP3_XO(Sqrtsd, sqrtsd)
+  AVX_OP3_XO(Orpd, orpd)
+  AVX_OP3_XO(Andnpd, andnpd)
 
 #undef AVX_OP3_XO
 #undef AVX_OP3_WITH_TYPE
+
+// Only use this macro when dst and src1 is the same in SSE case.
+#define AVX_PACKED_OP3_WITH_TYPE(macro_name, name, dst_type, src_type) \
+  void macro_name(dst_type dst, dst_type src1, src_type src2) {        \
+    if (CpuFeatures::IsSupported(AVX)) {                               \
+      CpuFeatureScope scope(this, AVX);                                \
+      v##name(dst, src1, src2);                                        \
+    } else {                                                           \
+      DCHECK_EQ(dst, src1);                                            \
+      name(dst, src2);                                                 \
+    }                                                                  \
+  }
+#define AVX_PACKED_OP3(macro_name, name)                               \
+  AVX_PACKED_OP3_WITH_TYPE(macro_name, name, XMMRegister, XMMRegister) \
+  AVX_PACKED_OP3_WITH_TYPE(macro_name, name, XMMRegister, Operand)
+
+  AVX_PACKED_OP3(Addpd, addpd)
+  AVX_PACKED_OP3(Subpd, subpd)
+  AVX_PACKED_OP3(Mulpd, mulpd)
+  AVX_PACKED_OP3(Divpd, divpd)
+  AVX_PACKED_OP3(Cmpeqpd, cmpeqpd)
+  AVX_PACKED_OP3(Cmpneqpd, cmpneqpd)
+  AVX_PACKED_OP3(Cmpltpd, cmpltpd)
+  AVX_PACKED_OP3(Cmplepd, cmplepd)
+  AVX_PACKED_OP3(Minpd, minpd)
+  AVX_PACKED_OP3(Maxpd, maxpd)
+  AVX_PACKED_OP3(Cmpunordpd, cmpunordpd)
+#undef AVX_PACKED_OP3
+#undef AVX_PACKED_OP3_WITH_TYPE
 
 // Non-SSE2 instructions.
 #define AVX_OP2_WITH_TYPE_SCOPE(macro_name, name, dst_type, src_type, \
@@ -517,8 +556,8 @@ class V8_EXPORT_PRIVATE MacroAssembler : public TurboAssembler {
   // Load the global proxy from the current context.
   void LoadGlobalProxy(Register dst);
 
-  // Load the global function with the given index.
-  void LoadGlobalFunction(int index, Register function);
+  // Load a value from the native context with a given index.
+  void LoadNativeContextSlot(Register dst, int index);
 
   // ---------------------------------------------------------------------------
   // JavaScript invokes
@@ -529,11 +568,11 @@ class V8_EXPORT_PRIVATE MacroAssembler : public TurboAssembler {
                           const ParameterCount& expected,
                           const ParameterCount& actual, InvokeFlag flag);
 
-  // On function call, call into the debugger if necessary.
+  // On function call, call into the debugger.
   // This may clobber ecx.
-  void CheckDebugHook(Register fun, Register new_target,
-                      const ParameterCount& expected,
-                      const ParameterCount& actual);
+  void CallDebugOnFunctionCall(Register fun, Register new_target,
+                               const ParameterCount& expected,
+                               const ParameterCount& actual);
 
   // Invoke the JavaScript function in the given register. Changes the
   // current context to the context in the function before invoking.
@@ -700,18 +739,6 @@ inline Operand FieldOperand(Register object, int offset) {
 inline Operand FieldOperand(Register object, Register index, ScaleFactor scale,
                             int offset) {
   return Operand(object, index, scale, offset - kHeapObjectTag);
-}
-
-inline Operand ContextOperand(Register context, int index) {
-  return Operand(context, Context::SlotOffset(index));
-}
-
-inline Operand ContextOperand(Register context, Register index) {
-  return Operand(context, index, times_tagged_size, Context::SlotOffset(0));
-}
-
-inline Operand NativeContextOperand() {
-  return ContextOperand(esi, Context::NATIVE_CONTEXT_INDEX);
 }
 
 #define ACCESS_MASM(masm) masm->

@@ -16,7 +16,6 @@
 #include "src/handles/global-handles.h"
 #include "src/init/bootstrapper.h"
 #include "src/objects/objects.h"
-#include "src/snapshot/natives.h"
 #include "src/utils/ostreams.h"
 #include "src/utils/vector.h"
 #include "src/zone/zone-chunk-list.h"
@@ -1111,19 +1110,16 @@ class DebugInfoSection : public DebugSection {
       }
 
       // See contexts.h for more information.
-      DCHECK_EQ(Context::MIN_CONTEXT_SLOTS, 4);
+      DCHECK_EQ(Context::MIN_CONTEXT_SLOTS, 3);
       DCHECK_EQ(Context::SCOPE_INFO_INDEX, 0);
       DCHECK_EQ(Context::PREVIOUS_INDEX, 1);
       DCHECK_EQ(Context::EXTENSION_INDEX, 2);
-      DCHECK_EQ(Context::NATIVE_CONTEXT_INDEX, 3);
       w->WriteULEB128(current_abbreviation++);
       w->WriteString(".scope_info");
       w->WriteULEB128(current_abbreviation++);
       w->WriteString(".previous");
       w->WriteULEB128(current_abbreviation++);
       w->WriteString(".extension");
-      w->WriteULEB128(current_abbreviation++);
-      w->WriteString(".native_context");
 
       for (int context_slot = 0; context_slot < context_slots; ++context_slot) {
         w->WriteULEB128(current_abbreviation++);

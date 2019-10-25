@@ -48,6 +48,7 @@ class FreeList;
 class Isolate;
 class LinearAllocationArea;
 class LocalArrayBufferTracker;
+class LocalSpace;
 class MemoryAllocator;
 class MemoryChunk;
 class MemoryChunkLayout;
@@ -129,12 +130,6 @@ static const FreeListCategoryType kInvalidCategory = -1;
 enum FreeMode { kLinkCategory, kDoNotLinkCategory };
 
 enum class SpaceAccountingMode { kSpaceAccounted, kSpaceUnaccounted };
-
-enum RememberedSetType {
-  OLD_TO_NEW,
-  OLD_TO_OLD,
-  NUMBER_OF_REMEMBERED_SET_TYPES = OLD_TO_OLD + 1
-};
 
 // A free list category maintains a linked list of free memory blocks.
 class FreeListCategory {
@@ -606,7 +601,7 @@ class MemoryChunk : public BasicMemoryChunk {
       + kSystemPointerSize           // Address owner_
       + kSizetSize                   // size_t progress_bar_
       + kIntptrSize                  // intptr_t live_byte_count_
-      + kSystemPointerSize * NUMBER_OF_REMEMBERED_SET_TYPES  // SlotSet* array
+      + kSystemPointerSize           // SlotSet* sweeping_slot_set_
       + kSystemPointerSize *
             NUMBER_OF_REMEMBERED_SET_TYPES  // TypedSlotSet* array
       + kSystemPointerSize *
@@ -645,8 +640,6 @@ class MemoryChunk : public BasicMemoryChunk {
 
   void SetOldGenerationPageFlags(bool is_marking);
   void SetYoungGenerationPageFlags(bool is_marking);
-
-  static inline MemoryChunk* FromAnyPointerAddress(Address addr);
 
   static inline void UpdateHighWaterMark(Address mark) {
     if (mark == kNullAddress) return;
@@ -706,6 +699,13 @@ class MemoryChunk : public BasicMemoryChunk {
     return slot_set_[type];
   }
 
+  template <AccessMode access_mode = AccessMode::ATOMIC>
+  SlotSet* sweeping_slot_set() {
+    if (access_mode == AccessMode::ATOMIC)
+      return base::AsAtomicPointer::Acquire_Load(&sweeping_slot_set_);
+    return sweeping_slot_set_;
+  }
+
   template <RememberedSetType type, AccessMode access_mode = AccessMode::ATOMIC>
   TypedSlotSet* typed_slot_set() {
     if (access_mode == AccessMode::ATOMIC)
@@ -715,9 +715,14 @@ class MemoryChunk : public BasicMemoryChunk {
 
   template <RememberedSetType type>
   V8_EXPORT_PRIVATE SlotSet* AllocateSlotSet();
+  SlotSet* AllocateSweepingSlotSet();
+  SlotSet* AllocateSlotSet(SlotSet** slot_set);
+
   // Not safe to be called concurrently.
   template <RememberedSetType type>
   void ReleaseSlotSet();
+  void ReleaseSlotSet(SlotSet** slot_set);
+  void ReleaseSweepingSlotSet();
   template <RememberedSetType type>
   TypedSlotSet* AllocateTypedSlotSet();
   // Not safe to be called concurrently.
@@ -729,12 +734,8 @@ class MemoryChunk : public BasicMemoryChunk {
   template <RememberedSetType type>
   void ReleaseInvalidatedSlots();
   template <RememberedSetType type>
-  V8_EXPORT_PRIVATE void RegisterObjectWithInvalidatedSlots(HeapObject object,
-                                                            int size);
-  // Updates invalidated_slots after array left-trimming.
-  template <RememberedSetType type>
-  void MoveObjectWithInvalidatedSlots(HeapObject old_start,
-                                      HeapObject new_start);
+  V8_EXPORT_PRIVATE void RegisterObjectWithInvalidatedSlots(HeapObject object);
+  void InvalidateRecordedSlots(HeapObject object);
   template <RememberedSetType type>
   bool RegisteredObjectWithInvalidatedSlots(HeapObject object);
   template <RememberedSetType type>
@@ -790,7 +791,6 @@ class MemoryChunk : public BasicMemoryChunk {
   inline Address MarkbitIndexToAddress(uint32_t index) const {
     return this->address() + (index << kTaggedSizeLog2);
   }
-
 
   bool NeverEvacuate() { return IsFlagSet(NEVER_EVACUATE); }
 
@@ -914,7 +914,7 @@ class MemoryChunk : public BasicMemoryChunk {
   // A single slot set for small pages (of size kPageSize) or an array of slot
   // set for large pages. In the latter case the number of entries in the array
   // is ceil(size() / kPageSize).
-  SlotSet* slot_set_[NUMBER_OF_REMEMBERED_SET_TYPES];
+  SlotSet* sweeping_slot_set_;
   TypedSlotSet* typed_slot_set_[NUMBER_OF_REMEMBERED_SET_TYPES];
   InvalidatedSlots* invalidated_slots_[NUMBER_OF_REMEMBERED_SET_TYPES];
 
@@ -1096,6 +1096,9 @@ class Page : public MemoryChunk {
   void InitializeFreeListCategories();
   void AllocateFreeListCategories();
   void ReleaseFreeListCategories();
+
+  void MoveOldToNewRememberedSetForSweeping();
+  void MergeOldToNewRememberedSets();
 
 #ifdef DEBUG
   void Print();
@@ -1687,7 +1690,6 @@ class LinearAllocationArea {
   Address limit_;
 };
 
-
 // An abstraction of the accounting statistics of a page-structured space.
 //
 // The stats are only set by functions that ensure they stay balanced. These
@@ -1768,7 +1770,6 @@ class AllocationStats {
   std::unordered_map<Page*, size_t, Page::Hasher> allocated_on_page_;
 #endif
 };
-
 
 // The free list is organized in categories as follows:
 // kMinBlockSize-10 words (tiniest): The tiniest blocks are only used for
@@ -2281,7 +2282,8 @@ class V8_EXPORT_PRIVATE PagedSpace
 
   // Creates a space with an id.
   PagedSpace(Heap* heap, AllocationSpace id, Executability executable,
-             FreeList* free_list);
+             FreeList* free_list,
+             LocalSpaceKind local_space_kind = LocalSpaceKind::kNone);
 
   ~PagedSpace() override { TearDown(); }
 
@@ -2457,11 +2459,18 @@ class V8_EXPORT_PRIVATE PagedSpace
   // Return size of allocatable area on a page in this space.
   inline int AreaSize() { return static_cast<int>(area_size_); }
 
-  virtual bool is_local() { return false; }
+  bool is_local_space() { return local_space_kind_ != LocalSpaceKind::kNone; }
+
+  bool is_compaction_space() {
+    return IsInRange(local_space_kind_, LocalSpaceKind::kFirstCompactionSpace,
+                     LocalSpaceKind::kLastCompactionSpace);
+  }
+
+  LocalSpaceKind local_space_kind() { return local_space_kind_; }
 
   // Merges {other} into the current space. Note that this modifies {other},
   // e.g., removes its bump pointer area and resets statistics.
-  void MergeCompactionSpace(CompactionSpace* other);
+  void MergeLocalSpace(LocalSpace* other);
 
   // Refills the free list from the corresponding free list filled by the
   // sweeper.
@@ -2498,7 +2507,7 @@ class V8_EXPORT_PRIVATE PagedSpace
   void DecreaseLimit(Address new_limit);
   void UpdateInlineAllocationLimit(size_t min_size) override;
   bool SupportsInlineAllocation() override {
-    return identity() == OLD_SPACE && !is_local();
+    return identity() == OLD_SPACE && !is_local_space();
   }
 
  protected:
@@ -2554,6 +2563,8 @@ class V8_EXPORT_PRIVATE PagedSpace
       int size_in_bytes, AllocationOrigin origin);
 
   Executability executable_;
+
+  LocalSpaceKind local_space_kind_;
 
   size_t area_size_;
 
@@ -2677,15 +2688,11 @@ class SemiSpace : public Space {
   // If we don't have these here then SemiSpace will be abstract.  However
   // they should never be called:
 
-  size_t Size() override {
-    UNREACHABLE();
-  }
+  size_t Size() override { UNREACHABLE(); }
 
   size_t SizeOfObjects() override { return Size(); }
 
-  size_t Available() override {
-    UNREACHABLE();
-  }
+  size_t Available() override { UNREACHABLE(); }
 
   Page* first_page() { return reinterpret_cast<Page*>(Space::first_page()); }
   Page* last_page() { return reinterpret_cast<Page*>(Space::last_page()); }
@@ -3026,19 +3033,34 @@ class V8_EXPORT_PRIVATE PauseAllocationObserversScope {
 };
 
 // -----------------------------------------------------------------------------
-// Compaction space that is used temporarily during compaction.
+// Base class for compaction space and off-thread space.
 
-class V8_EXPORT_PRIVATE CompactionSpace : public PagedSpace {
+class V8_EXPORT_PRIVATE LocalSpace : public PagedSpace {
  public:
-  CompactionSpace(Heap* heap, AllocationSpace id, Executability executable)
-      : PagedSpace(heap, id, executable, FreeList::CreateFreeList()) {}
-
-  bool is_local() override { return true; }
+  LocalSpace(Heap* heap, AllocationSpace id, Executability executable,
+             LocalSpaceKind local_space_kind)
+      : PagedSpace(heap, id, executable, FreeList::CreateFreeList(),
+                   local_space_kind) {
+    DCHECK_NE(local_space_kind, LocalSpaceKind::kNone);
+  }
 
  protected:
   // The space is temporary and not included in any snapshots.
   bool snapshotable() override { return false; }
+};
 
+// -----------------------------------------------------------------------------
+// Compaction space that is used temporarily during compaction.
+
+class V8_EXPORT_PRIVATE CompactionSpace : public LocalSpace {
+ public:
+  CompactionSpace(Heap* heap, AllocationSpace id, Executability executable,
+                  LocalSpaceKind local_space_kind)
+      : LocalSpace(heap, id, executable, local_space_kind) {
+    DCHECK(is_compaction_space());
+  }
+
+ protected:
   V8_WARN_UNUSED_RESULT bool SweepAndRetryAllocation(
       int size_in_bytes, AllocationOrigin origin) override;
 
@@ -3049,9 +3071,12 @@ class V8_EXPORT_PRIVATE CompactionSpace : public PagedSpace {
 // A collection of |CompactionSpace|s used by a single compaction task.
 class CompactionSpaceCollection : public Malloced {
  public:
-  explicit CompactionSpaceCollection(Heap* heap)
-      : old_space_(heap, OLD_SPACE, Executability::NOT_EXECUTABLE),
-        code_space_(heap, CODE_SPACE, Executability::EXECUTABLE) {}
+  explicit CompactionSpaceCollection(Heap* heap,
+                                     LocalSpaceKind local_space_kind)
+      : old_space_(heap, OLD_SPACE, Executability::NOT_EXECUTABLE,
+                   local_space_kind),
+        code_space_(heap, CODE_SPACE, Executability::EXECUTABLE,
+                    local_space_kind) {}
 
   CompactionSpace* Get(AllocationSpace space) {
     switch (space) {
@@ -3105,7 +3130,6 @@ class CodeSpace : public PagedSpace {
               (info).top() <= (space).page_high() &&  \
               (info).limit() <= (space).page_high())
 
-
 // -----------------------------------------------------------------------------
 // Old space for all map objects
 
@@ -3128,6 +3152,25 @@ class MapSpace : public PagedSpace {
 #ifdef VERIFY_HEAP
   void VerifyObject(HeapObject obj) override;
 #endif
+};
+
+// -----------------------------------------------------------------------------
+// Off-thread space that is used for folded allocation on a different thread.
+
+class V8_EXPORT_PRIVATE OffThreadSpace : public LocalSpace {
+ public:
+  explicit OffThreadSpace(Heap* heap)
+      : LocalSpace(heap, OLD_SPACE, NOT_EXECUTABLE,
+                   LocalSpaceKind::kOffThreadSpace) {}
+
+ protected:
+  V8_WARN_UNUSED_RESULT bool SweepAndRetryAllocation(
+      int size_in_bytes, AllocationOrigin origin) override;
+
+  V8_WARN_UNUSED_RESULT bool SlowRefillLinearAllocationArea(
+      int size_in_bytes, AllocationOrigin origin) override;
+
+  void RefillFreeList() override;
 };
 
 // -----------------------------------------------------------------------------

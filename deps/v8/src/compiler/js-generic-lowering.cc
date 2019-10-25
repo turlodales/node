@@ -236,14 +236,15 @@ void JSGenericLowering::LowerJSLoadGlobal(Node* node) {
 }
 
 void JSGenericLowering::LowerJSGetIterator(Node* node) {
-  CallDescriptor::Flags flags = FrameStateFlagForCall(node);
-  const PropertyAccess& p = PropertyAccessOf(node->op());
-  node->InsertInput(zone(), 1, jsgraph()->SmiConstant(p.feedback().index()));
-  Node* vector = jsgraph()->HeapConstant(p.feedback().vector);
-  node->InsertInput(zone(), 2, vector);
-  Callable callable =
-      Builtins::CallableFor(isolate(), Builtins::kGetIteratorWithFeedback);
-  ReplaceWithStubCall(node, callable, flags);
+  // TODO(v8:9625): Currently, the GetIterator operator is desugared in the
+  // native context specialization phase. Thus, the following generic lowering
+  // would never be reachable. We can add a check in native context
+  // specialization to avoid desugaring the GetIterator operator when in the
+  // case of megamorphic feedback and here, add a call to the
+  // 'GetIteratorWithFeedback' builtin. This would reduce the size of the
+  // compiled code as it would insert 1 call to the builtin instead of 2 calls
+  // resulting from the generic lowering of the LoadNamed and Call operators.
+  UNREACHABLE();
 }
 
 void JSGenericLowering::LowerJSStoreProperty(Node* node) {
@@ -375,6 +376,10 @@ void JSGenericLowering::LowerJSOrdinaryHasInstance(Node* node) {
   Callable callable =
       Builtins::CallableFor(isolate(), Builtins::kOrdinaryHasInstance);
   ReplaceWithStubCall(node, callable, flags);
+}
+
+void JSGenericLowering::LowerJSHasContextExtension(Node* node) {
+  UNREACHABLE();  // Eliminated in typed lowering.
 }
 
 void JSGenericLowering::LowerJSLoadContext(Node* node) {
@@ -559,6 +564,10 @@ void JSGenericLowering::LowerJSCreateLiteralArray(Node* node) {
     node->InsertInput(zone(), 3, jsgraph()->SmiConstant(p.flags()));
     ReplaceWithRuntimeCall(node, Runtime::kCreateArrayLiteral);
   }
+}
+
+void JSGenericLowering::LowerJSGetTemplateObject(Node* node) {
+  UNREACHABLE();  // Eliminated in native context specialization.
 }
 
 void JSGenericLowering::LowerJSCreateEmptyLiteralArray(Node* node) {
@@ -849,7 +858,8 @@ void JSGenericLowering::LowerJSStackCheck(Node* node) {
                            ExternalReference::address_of_jslimit(isolate())),
                        jsgraph()->IntPtrConstant(0), effect, control);
 
-  Node* check = graph()->NewNode(machine()->StackPointerGreaterThan(), limit);
+  Node* check = effect =
+      graph()->NewNode(machine()->StackPointerGreaterThan(), limit, effect);
   Node* branch =
       graph()->NewNode(common()->Branch(BranchHint::kTrue), check, control);
 

@@ -182,6 +182,8 @@ TEST(DisasmX64) {
   __ decq(rdx);
   __ cdq();
 
+  __ repstosq();
+
   __ nop();
   __ idivq(rdx);
   __ mull(rdx);
@@ -266,7 +268,6 @@ TEST(DisasmX64) {
 
   __ xorq(rdx, Immediate(12345));
   __ xorq(rdx, Operand(rbx, rcx, times_8, 10000));
-  __ pshufw(xmm5, xmm1, 3);
   __ hlt();
   __ int3();
   __ ret(0);
@@ -392,16 +393,6 @@ TEST(DisasmX64) {
     __ movdqu(Operand(rsp, 12), xmm0);
     __ shufps(xmm0, xmm9, 0x0);
 
-    // logic operation
-    __ andps(xmm0, xmm1);
-    __ andps(xmm0, Operand(rbx, rcx, times_4, 10000));
-    __ andnps(xmm0, xmm1);
-    __ andnps(xmm0, Operand(rbx, rcx, times_4, 10000));
-    __ orps(xmm0, xmm1);
-    __ orps(xmm0, Operand(rbx, rcx, times_4, 10000));
-    __ xorps(xmm0, xmm1);
-    __ xorps(xmm0, Operand(rbx, rcx, times_4, 10000));
-
     // Arithmetic operation
     __ addss(xmm1, xmm0);
     __ addss(xmm1, Operand(rbx, rcx, times_4, 10000));
@@ -417,17 +408,15 @@ TEST(DisasmX64) {
     __ minss(xmm1, Operand(rbx, rcx, times_4, 10000));
     __ sqrtss(xmm1, xmm0);
     __ sqrtss(xmm1, Operand(rbx, rcx, times_4, 10000));
-    __ addps(xmm1, xmm0);
-    __ addps(xmm1, Operand(rbx, rcx, times_4, 10000));
-    __ subps(xmm1, xmm0);
-    __ subps(xmm1, Operand(rbx, rcx, times_4, 10000));
-    __ mulps(xmm1, xmm0);
-    __ mulps(xmm1, Operand(rbx, rcx, times_4, 10000));
-    __ divps(xmm1, xmm0);
-    __ divps(xmm1, Operand(rbx, rcx, times_4, 10000));
 
     __ ucomiss(xmm0, xmm1);
     __ ucomiss(xmm0, Operand(rbx, rcx, times_4, 10000));
+
+#define EMIT_SSE_INSTR(instruction, notUsed1, notUsed2) \
+  __ instruction(xmm1, xmm0);                           \
+  __ instruction(xmm1, Operand(rbx, rcx, times_4, 10000));
+    SSE_INSTRUCTION_LIST(EMIT_SSE_INSTR)
+#undef EMIT_SSE_INSTR
   }
 
   // SSE2 instructions
@@ -581,10 +570,6 @@ TEST(DisasmX64) {
       __ cmpnlepd(xmm5, xmm1);
       __ cmpnlepd(xmm5, Operand(rbx, rcx, times_4, 10000));
 
-      __ minps(xmm5, xmm1);
-      __ minps(xmm5, Operand(rdx, 4));
-      __ maxps(xmm5, xmm1);
-      __ maxps(xmm5, Operand(rdx, 4));
       __ rcpps(xmm5, xmm1);
       __ rcpps(xmm5, Operand(rdx, 4));
       __ sqrtps(xmm5, xmm1);
@@ -592,6 +577,7 @@ TEST(DisasmX64) {
       __ movups(xmm5, xmm1);
       __ movups(xmm5, Operand(rdx, 4));
       __ movups(Operand(rdx, 4), xmm5);
+      __ movlhps(xmm5, xmm1);
       __ pmulld(xmm5, xmm1);
       __ pmulld(xmm5, Operand(rdx, 4));
       __ pmullw(xmm5, xmm1);
@@ -655,6 +641,9 @@ TEST(DisasmX64) {
       __ vmovsd(xmm6, xmm14, xmm2);
       __ vmovsd(xmm9, Operand(rbx, rcx, times_4, 10000));
       __ vmovsd(Operand(rbx, rcx, times_4, 10000), xmm0);
+
+      __ vmovdqu(xmm9, Operand(rbx, rcx, times_4, 10000));
+      __ vmovdqu(Operand(rbx, rcx, times_4, 10000), xmm0);
 
       __ vaddsd(xmm0, xmm1, xmm2);
       __ vaddsd(xmm0, xmm1, Operand(rbx, rcx, times_4, 10000));
@@ -762,6 +751,10 @@ TEST(DisasmX64) {
 #undef EMIT_SSE2_AVXINSTR
 #undef EMIT_SSE34_AVXINSTR
 
+      __ vinsertps(xmm1, xmm2, xmm3, 1);
+      __ vinsertps(xmm1, xmm2, Operand(rbx, rcx, times_4, 10000), 1);
+      __ vextractps(rax, xmm1, 1);
+
       __ vlddqu(xmm1, Operand(rbx, rcx, times_4, 10000));
       __ vpsllw(xmm0, xmm15, 21);
       __ vpsrlw(xmm0, xmm15, 21);
@@ -781,6 +774,10 @@ TEST(DisasmX64) {
       __ vpinsrd(xmm1, xmm2, rax, 2);
       __ vpinsrd(xmm1, xmm2, Operand(rbx, rcx, times_4, 10000), 2);
       __ vpshufd(xmm1, xmm2, 85);
+      __ vshufps(xmm3, xmm2, xmm3, 3);
+
+      __ vcvtdq2ps(xmm5, xmm1);
+      __ vcvtdq2ps(xmm5, Operand(rdx, 4));
     }
   }
 
@@ -850,6 +847,15 @@ TEST(DisasmX64) {
       __ vfnmsub213ss(xmm0, xmm1, Operand(rbx, rcx, times_4, 10000));
       __ vfnmsub231ss(xmm0, xmm1, xmm2);
       __ vfnmsub231ss(xmm0, xmm1, Operand(rbx, rcx, times_4, 10000));
+
+      __ vfmadd231ps(xmm0, xmm1, xmm2);
+      __ vfmadd231ps(xmm0, xmm1, Operand(rbx, rcx, times_4, 10000));
+      __ vfnmadd231ps(xmm0, xmm1, xmm2);
+      __ vfnmadd231ps(xmm0, xmm1, Operand(rbx, rcx, times_4, 10000));
+      __ vfmadd231pd(xmm0, xmm1, xmm2);
+      __ vfmadd231pd(xmm0, xmm1, Operand(rbx, rcx, times_4, 10000));
+      __ vfnmadd231pd(xmm0, xmm1, xmm2);
+      __ vfnmadd231pd(xmm0, xmm1, Operand(rbx, rcx, times_4, 10000));
     }
   }
 

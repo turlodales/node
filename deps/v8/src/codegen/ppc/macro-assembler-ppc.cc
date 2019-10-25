@@ -209,6 +209,12 @@ void TurboAssembler::Jump(const ExternalReference& reference) {
   UseScratchRegisterScope temps(this);
   Register scratch = temps.Acquire();
   Move(scratch, reference);
+  if (ABI_USES_FUNCTION_DESCRIPTORS) {
+    // AIX uses a function descriptor. When calling C code be
+    // aware of this descriptor and pick up values from it.
+    LoadP(ToRegister(ABI_TOC_REGISTER), MemOperand(scratch, kPointerSize));
+    LoadP(scratch, MemOperand(scratch, 0));
+  }
   Jump(scratch);
 }
 
@@ -311,21 +317,23 @@ void TurboAssembler::Push(Smi smi) {
 }
 
 void TurboAssembler::Move(Register dst, Handle<HeapObject> value) {
-  if (FLAG_embedded_builtins) {
-    if (root_array_available_ && options().isolate_independent_code) {
-      IndirectLoadConstant(dst, value);
-      return;
-    }
+  // TODO(jgruber,v8:8887): Also consider a root-relative load when generating
+  // non-isolate-independent code. In many cases it might be cheaper than
+  // embedding the relocatable value.
+  if (root_array_available_ && options().isolate_independent_code) {
+    IndirectLoadConstant(dst, value);
+    return;
   }
   mov(dst, Operand(value));
 }
 
 void TurboAssembler::Move(Register dst, ExternalReference reference) {
-  if (FLAG_embedded_builtins) {
-    if (root_array_available_ && options().isolate_independent_code) {
-      IndirectLoadExternalReference(dst, reference);
-      return;
-    }
+  // TODO(jgruber,v8:8887): Also consider a root-relative load when generating
+  // non-isolate-independent code. In many cases it might be cheaper than
+  // embedding the relocatable value.
+  if (root_array_available_ && options().isolate_independent_code) {
+    IndirectLoadExternalReference(dst, reference);
+    return;
   }
   mov(dst, Operand(reference));
 }
@@ -1287,12 +1295,11 @@ void MacroAssembler::CheckDebugHook(Register fun, Register new_target,
   {
     // Load receiver to pass it later to DebugOnFunctionCall hook.
     if (actual.is_reg()) {
-      mr(r7, actual.reg());
+      ShiftLeftImm(r7, actual.reg(), Operand(kPointerSizeLog2));
+      LoadPX(r7, MemOperand(sp, r7));
     } else {
-      mov(r7, Operand(actual.immediate()));
+      LoadP(r7, MemOperand(sp, actual.immediate() << kPointerSizeLog2), r0);
     }
-    ShiftLeftImm(r7, r7, Operand(kPointerSizeLog2));
-    LoadPX(r7, MemOperand(sp, r7));
     FrameScope frame(this,
                      has_frame() ? StackFrame::NONE : StackFrame::INTERNAL);
     if (expected.is_reg()) {
@@ -1446,7 +1453,7 @@ void MacroAssembler::CompareObjectType(Register object, Register map,
                                        Register type_reg, InstanceType type) {
   const Register temp = type_reg == no_reg ? r0 : type_reg;
 
-  LoadP(map, FieldMemOperand(object, HeapObject::kMapOffset));
+  LoadMap(map, object);
   CompareInstanceType(map, temp, type);
 }
 
@@ -1764,9 +1771,15 @@ void TurboAssembler::Abort(AbortReason reason) {
   // will not return here
 }
 
+void MacroAssembler::LoadMap(Register destination, Register object) {
+  LoadP(destination, FieldMemOperand(object, HeapObject::kMapOffset));
+}
+
 void MacroAssembler::LoadNativeContextSlot(int index, Register dst) {
-  LoadP(dst, NativeContextMemOperand());
-  LoadP(dst, ContextMemOperand(dst, index));
+  LoadMap(dst, cp);
+  LoadP(dst, FieldMemOperand(
+                 dst, Map::kConstructorOrBackPointerOrNativeContextOffset));
+  LoadP(dst, MemOperand(dst, Context::SlotOffset(index)));
 }
 
 void MacroAssembler::AssertNotSmi(Register object) {
@@ -1791,7 +1804,7 @@ void MacroAssembler::AssertConstructor(Register object) {
     TestIfSmi(object, r0);
     Check(ne, AbortReason::kOperandIsASmiAndNotAConstructor, cr0);
     push(object);
-    LoadP(object, FieldMemOperand(object, HeapObject::kMapOffset));
+    LoadMap(object, object);
     lbz(object, FieldMemOperand(object, Map::kBitFieldOffset));
     andi(object, object, Operand(Map::IsConstructorBit::kMask));
     pop(object);
@@ -1831,7 +1844,7 @@ void MacroAssembler::AssertGeneratorObject(Register object) {
   // Load map
   Register map = object;
   push(object);
-  LoadP(map, FieldMemOperand(object, HeapObject::kMapOffset));
+  LoadMap(map, object);
 
   // Check if JSGeneratorObject
   Label do_check;
@@ -1859,7 +1872,7 @@ void MacroAssembler::AssertUndefinedOrAllocationSite(Register object,
     AssertNotSmi(object);
     CompareRoot(object, RootIndex::kUndefinedValue);
     beq(&done_checking);
-    LoadP(scratch, FieldMemOperand(object, HeapObject::kMapOffset));
+    LoadMap(scratch, object);
     CompareInstanceType(scratch, scratch, ALLOCATION_SITE_TYPE);
     Assert(eq, AbortReason::kExpectedUndefinedOrCell);
     bind(&done_checking);
@@ -1931,28 +1944,35 @@ void TurboAssembler::MovToFloatParameters(DoubleRegister src1,
 
 void TurboAssembler::CallCFunction(ExternalReference function,
                                    int num_reg_arguments,
-                                   int num_double_arguments) {
+                                   int num_double_arguments,
+                                   bool has_function_descriptor) {
   Move(ip, function);
-  CallCFunctionHelper(ip, num_reg_arguments, num_double_arguments);
+  CallCFunctionHelper(ip, num_reg_arguments, num_double_arguments,
+                      has_function_descriptor);
 }
 
 void TurboAssembler::CallCFunction(Register function, int num_reg_arguments,
-                                   int num_double_arguments) {
-  CallCFunctionHelper(function, num_reg_arguments, num_double_arguments);
+                                   int num_double_arguments,
+                                   bool has_function_descriptor) {
+  CallCFunctionHelper(function, num_reg_arguments, num_double_arguments,
+                      has_function_descriptor);
 }
 
 void TurboAssembler::CallCFunction(ExternalReference function,
-                                   int num_arguments) {
-  CallCFunction(function, num_arguments, 0);
+                                   int num_arguments,
+                                   bool has_function_descriptor) {
+  CallCFunction(function, num_arguments, 0, has_function_descriptor);
 }
 
-void TurboAssembler::CallCFunction(Register function, int num_arguments) {
-  CallCFunction(function, num_arguments, 0);
+void TurboAssembler::CallCFunction(Register function, int num_arguments,
+                                   bool has_function_descriptor) {
+  CallCFunction(function, num_arguments, 0, has_function_descriptor);
 }
 
 void TurboAssembler::CallCFunctionHelper(Register function,
                                          int num_reg_arguments,
-                                         int num_double_arguments) {
+                                         int num_double_arguments,
+                                         bool has_function_descriptor) {
   DCHECK_LE(num_reg_arguments + num_double_arguments, kMaxCParameters);
   DCHECK(has_frame());
 
@@ -1977,7 +1997,7 @@ void TurboAssembler::CallCFunctionHelper(Register function,
   // allow preemption, so the return address in the link register
   // stays correct.
   Register dest = function;
-  if (ABI_USES_FUNCTION_DESCRIPTORS) {
+  if (ABI_USES_FUNCTION_DESCRIPTORS && has_function_descriptor) {
     // AIX/PPC64BE Linux uses a function descriptor. When calling C code be
     // aware of this descriptor and pick up values from it
     LoadP(ToRegister(ABI_TOC_REGISTER), MemOperand(function, kPointerSize));
@@ -2409,51 +2429,51 @@ void MacroAssembler::Xor(Register ra, Register rs, const Operand& rb,
 
 void MacroAssembler::CmpSmiLiteral(Register src1, Smi smi, Register scratch,
                                    CRegister cr) {
-#if V8_TARGET_ARCH_PPC64
+#if defined(V8_COMPRESS_POINTERS) || defined(V8_31BIT_SMIS_ON_64BIT_ARCH)
+  Cmpi(src1, Operand(smi), scratch, cr);
+#else
   LoadSmiLiteral(scratch, smi);
   cmp(src1, scratch, cr);
-#else
-  Cmpi(src1, Operand(smi), scratch, cr);
 #endif
 }
 
 void MacroAssembler::CmplSmiLiteral(Register src1, Smi smi, Register scratch,
                                     CRegister cr) {
-#if V8_TARGET_ARCH_PPC64
+#if defined(V8_COMPRESS_POINTERS) || defined(V8_31BIT_SMIS_ON_64BIT_ARCH)
+  Cmpli(src1, Operand(smi), scratch, cr);
+#else
   LoadSmiLiteral(scratch, smi);
   cmpl(src1, scratch, cr);
-#else
-  Cmpli(src1, Operand(smi), scratch, cr);
 #endif
 }
 
 void MacroAssembler::AddSmiLiteral(Register dst, Register src, Smi smi,
                                    Register scratch) {
-#if V8_TARGET_ARCH_PPC64
+#if defined(V8_COMPRESS_POINTERS) || defined(V8_31BIT_SMIS_ON_64BIT_ARCH)
+  Add(dst, src, static_cast<intptr_t>(smi.ptr()), scratch);
+#else
   LoadSmiLiteral(scratch, smi);
   add(dst, src, scratch);
-#else
-  Add(dst, src, reinterpret_cast<intptr_t>(smi), scratch);
 #endif
 }
 
 void MacroAssembler::SubSmiLiteral(Register dst, Register src, Smi smi,
                                    Register scratch) {
-#if V8_TARGET_ARCH_PPC64
+#if defined(V8_COMPRESS_POINTERS) || defined(V8_31BIT_SMIS_ON_64BIT_ARCH)
+  Add(dst, src, -(static_cast<intptr_t>(smi.ptr())), scratch);
+#else
   LoadSmiLiteral(scratch, smi);
   sub(dst, src, scratch);
-#else
-  Add(dst, src, -(reinterpret_cast<intptr_t>(smi)), scratch);
 #endif
 }
 
 void MacroAssembler::AndSmiLiteral(Register dst, Register src, Smi smi,
                                    Register scratch, RCBit rc) {
-#if V8_TARGET_ARCH_PPC64
+#if defined(V8_COMPRESS_POINTERS) || defined(V8_31BIT_SMIS_ON_64BIT_ARCH)
+  And(dst, src, Operand(smi), rc);
+#else
   LoadSmiLiteral(scratch, smi);
   and_(dst, src, scratch, rc);
-#else
-  And(dst, src, Operand(smi), rc);
 #endif
 }
 
@@ -2941,14 +2961,18 @@ void TurboAssembler::JumpIfLessThan(Register x, int32_t y, Label* dest) {
 
 void TurboAssembler::LoadEntryFromBuiltinIndex(Register builtin_index) {
   STATIC_ASSERT(kSystemPointerSize == 8);
-  STATIC_ASSERT(kSmiShiftSize == 31);
   STATIC_ASSERT(kSmiTagSize == 1);
   STATIC_ASSERT(kSmiTag == 0);
 
   // The builtin_index register contains the builtin index as a Smi.
   // Untagging is folded into the indexing operand below.
+#if defined(V8_COMPRESS_POINTERS) || defined(V8_31BIT_SMIS_ON_64BIT_ARCH)
+  ShiftLeftImm(builtin_index, builtin_index,
+               Operand(kSystemPointerSizeLog2 - kSmiShift));
+#else
   ShiftRightArithImm(builtin_index, builtin_index,
                      kSmiShift - kSystemPointerSizeLog2);
+#endif
   addi(builtin_index, builtin_index,
        Operand(IsolateData::builtin_entry_table_offset()));
   LoadPX(builtin_index, MemOperand(kRootRegister, builtin_index));
