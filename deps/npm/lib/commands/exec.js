@@ -1,31 +1,7 @@
+const { resolve } = require('node:path')
 const libexec = require('libnpmexec')
-const BaseCommand = require('../base-command.js')
-const getLocationMsg = require('../exec/get-workspace-location-msg.js')
-
-// it's like this:
-//
-// npm x pkg@version <-- runs the bin named "pkg" or the only bin if only 1
-//
-// { name: 'pkg', bin: { pkg: 'pkg.js', foo: 'foo.js' }} <-- run pkg
-// { name: 'pkg', bin: { foo: 'foo.js' }} <-- run foo?
-//
-// npm x -p pkg@version -- foo
-//
-// npm x -p pkg@version -- foo --registry=/dev/null
-//
-// const pkg = npm.config.get('package') || getPackageFrom(args[0])
-// const cmd = getCommand(pkg, args[0])
-// --> npm x -c 'cmd ...args.slice(1)'
-//
-// we've resolved cmd and args, and escaped them properly, and installed the
-// relevant packages.
-//
-// Add the ${npx install prefix}/node_modules/.bin to PATH
-//
-// pkg = readPackageJson('./package.json')
-// pkg.scripts.___npx = ${the -c arg}
-// runScript({ pkg, event: 'npx', ... })
-// process.env.npm_lifecycle_event = 'npx'
+const resolveAllowScripts = require('../utils/resolve-allow-scripts.js')
+const BaseCommand = require('../base-cmd.js')
 
 class Exec extends BaseCommand {
   static description = 'Run a command from a local or remote npm package'
@@ -35,6 +11,9 @@ class Exec extends BaseCommand {
     'workspace',
     'workspaces',
     'include-workspace-root',
+    'allow-scripts',
+    'strict-allow-scripts',
+    'dangerously-allow-all-scripts',
   ]
 
   static name = 'exec'
@@ -45,59 +24,95 @@ class Exec extends BaseCommand {
     '--package=foo -c \'<cmd> [args...]\'',
   ]
 
+  static workspaces = true
   static ignoreImplicitWorkspace = false
   static isShellout = true
 
-  async exec (_args, { locationMsg, runPath } = {}) {
-    const path = this.npm.localPrefix
+  async exec (args) {
+    return this.callExec(args)
+  }
 
+  async execWorkspaces (args) {
+    await this.setWorkspaces()
+
+    for (const [name, path] of this.workspaces) {
+      const locationMsg =
+        `in workspace ${this.npm.chalk.green(name)} at location:\n${this.npm.chalk.dim(path)}`
+      await this.callExec(args, { name, locationMsg, runPath: path })
+    }
+  }
+
+  async callExec (args, { locationMsg, runPath } = {}) {
+    let localBin = this.npm.localBin
+    let pkgPath = this.npm.localPrefix
+
+    // This is where libnpmexec will actually run the scripts from
     if (!runPath) {
       runPath = process.cwd()
+    } else {
+      // Use the workspace's own node_modules/.bin, not localDir/<name>, since the linked strategy does not symlink workspaces into the root node_modules.
+      localBin = resolve(runPath, 'node_modules', '.bin')
+      // We also need to look for `bin` entries in the workspace package.json
+      // libnpmexec will NOT look in the project root for the bin entry
+      pkgPath = runPath
     }
 
-    const args = [..._args]
     const call = this.npm.config.get('call')
+    let globalPath
     const {
       flatOptions,
-      localBin,
       globalBin,
+      globalDir,
+      chalk,
     } = this.npm
-    const output = (...outputArgs) => this.npm.output(...outputArgs)
     const scriptShell = this.npm.config.get('script-shell') || undefined
     const packages = this.npm.config.get('package')
     const yes = this.npm.config.get('yes')
+    // --prefix sets both of these to the same thing, meaning the global prefix is invalid (i.e. no lib/node_modules).
+    // This is not a trivial thing to untangle and fix so we work around it here.
+    if (this.npm.localPrefix !== this.npm.globalPrefix) {
+      globalPath = resolve(globalDir, '..')
+    }
 
-    if (call && _args.length) {
+    if (call && args.length) {
       throw this.usageError()
     }
 
+    // Resolve the install-script policy from the user/global .npmrc layer
+    // only. The RFC requires exec/npx to ignore any project
+    // package.json#allowScripts; CLI flags still apply.
+    const { policy: allowScriptsPolicy } = await resolveAllowScripts(this.npm, {
+      skipProjectConfig: true,
+    })
+
     return libexec({
       ...flatOptions,
-      // we explicitly set packageLockOnly to false because if it's true
-      // when we try to install a missing package, we won't actually install it
+      allowScripts: allowScriptsPolicy,
+      // we explicitly set packageLockOnly to false because if it's true when we try to install a missing package, we won't actually install it
       packageLockOnly: false,
-      args,
+      // what the user asked to run args[0] is run by default
+      args: [...args], // copy args so they don't get mutated
+      // specify a custom command to be run instead of args[0]
       call,
+      chalk,
+      // where to look for bins globally, if a file matches call or args[0] it is called
+      globalBin,
+      // where to look for packages globally, if a package matches call or args[0] it is called
+      globalPath,
+      // where to look for bins locally, if a file matches call or args[0] it is called
       localBin,
       locationMsg,
-      globalBin,
-      output,
+      // packages that need to be installed
       packages,
-      path,
+      // path where node_modules is
+      path: this.npm.localPrefix,
+      // where to look for package.json#bin entries first
+      pkgPath,
+      // cwd to run from
       runPath,
       scriptShell,
       yes,
     })
-  }
-
-  async execWorkspaces (args, filters) {
-    await this.setWorkspaces(filters)
-    const color = this.npm.color
-
-    for (const path of this.workspacePaths) {
-      const locationMsg = await getLocationMsg({ color, path })
-      await this.exec(args, { locationMsg, runPath: path })
-    }
   }
 }
 

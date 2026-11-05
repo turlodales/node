@@ -5,32 +5,26 @@ const net = require('net');
 
 const sockets = [];
 
-const server = net.createServer(function(c) {
+const server = net.createServer(common.mustCallAtLeast((c) => {
   c.on('close', common.mustCall());
 
   sockets.push(c);
 
   if (sockets.length === 2) {
     assert.strictEqual(server.close(), server);
-    sockets.forEach((c) => c.resetAndDestroy());
+    for (const c of sockets) c.resetAndDestroy();
   }
-});
+}));
 
 server.on('close', common.mustCall());
 
-assert.strictEqual(server, server.listen(0, () => {
+assert.strictEqual(server, server.listen(0, common.mustCall(() => {
   net.createConnection(server.address().port)
-    .on('error', common.mustCall(
-      common.expectsError({
-        code: 'ECONNRESET',
-        name: 'Error'
-      }))
-    );
+    .on('error', common.mustCall((error) => {
+      assert.strictEqual(error.code, 'ECONNRESET');
+    }));
   net.createConnection(server.address().port)
-    .on('error', common.mustCall(
-      common.expectsError({
-        code: 'ECONNRESET',
-        name: 'Error'
-      }))
-    );
-}));
+    .on('error', common.mustCall((error) => {
+      assert.strictEqual(error.code, 'ECONNRESET');
+    }));
+})));

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --allow-natives-syntax --opt --no-always-opt --no-stress-opt --deopt-every-n-times=0 --ignore-unhandled-promises
+// Flags: --allow-natives-syntax --turbofan --deopt-every-n-times=0 --ignore-unhandled-promises
 
 let log = [];
 let asyncId = 0;
@@ -184,6 +184,7 @@ function exceptions() {
 // when context promise hooks are attached.
 function optimizerBailout(test, verify) {
   // Warm up test method
+  %DeoptimizeFunction(test);
   %PrepareFunctionForOptimization(test);
   assertUnoptimized(test);
   test();
@@ -200,7 +201,8 @@ function optimizerBailout(test, verify) {
 
   // Verify that attaching hooks deopts the async function
   d8.promise.setHooks(initHook, beforeHook, afterHook, resolveHook);
-  // assertUnoptimized(test);
+  %DeoptimizeFunction(test);
+  assertUnoptimized(test);
 
   // Verify log structure of deoptimized call
   %PrepareFunctionForOptimization(test);
@@ -220,7 +222,7 @@ function optimizerBailout(test, verify) {
   d8.promise.setHooks();
 }
 
-if (has_promise_hooks) {
+function doTest () {
   optimizerBailout(async () => {
     await Promise.resolve();
   }, () => {
@@ -235,7 +237,35 @@ if (has_promise_hooks) {
     assertEmptyLog();
   });
   optimizerBailout(async () => {
+    await Promise.reject();
+  }, () => {
+    assertNextEvent('init', [ 1 ]);
+    assertNextEvent('init', [ 2 ]);
+    assertNextEvent('resolve', [ 2 ]);
+    assertNextEvent('init', [ 3, 2 ]);
+    assertNextEvent('before', [ 3 ]);
+    assertNextEvent('resolve', [ 1 ]);
+    assertNextEvent('resolve', [ 3 ]);
+    assertNextEvent('after', [ 3 ]);
+    assertEmptyLog();
+  });
+  optimizerBailout(async () => {
     await { then (cb) { cb() } };
+  }, () => {
+    assertNextEvent('init', [ 1 ]);
+    assertNextEvent('init', [ 2, 1 ]);
+    assertNextEvent('init', [ 3, 2 ]);
+    assertNextEvent('before', [ 2 ]);
+    assertNextEvent('resolve', [ 2 ]);
+    assertNextEvent('after', [ 2 ]);
+    assertNextEvent('before', [ 3 ]);
+    assertNextEvent('resolve', [ 1 ]);
+    assertNextEvent('resolve', [ 3 ]);
+    assertNextEvent('after', [ 3 ]);
+    assertEmptyLog();
+  });
+  optimizerBailout(async () => {
+    await { then (_, cb) { cb() } };
   }, () => {
     assertNextEvent('init', [ 1 ]);
     assertNextEvent('init', [ 2, 1 ]);
@@ -291,4 +321,10 @@ if (has_promise_hooks) {
     d8.promise.setHooks();
   });
 
+}
+
+if (has_promise_hooks) {
+  doTest();
+  d8.debugger.enable();
+  doTest();
 }

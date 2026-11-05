@@ -3,8 +3,9 @@
 
 #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
 
-// FIXME(joyeecheung): nghttp2.h needs stdint.h to compile on Windows
-#include <cstdint>
+// clang-format off
+#include "node.h"  // nghttp2.h needs ssize_t
+// clang-format on
 #include "nghttp2/nghttp2.h"
 
 #include "env.h"
@@ -38,11 +39,15 @@ constexpr size_t kDefaultMaxSettings = 10;
 // Default maximum total memory cap for Http2Session.
 constexpr uint64_t kDefaultMaxSessionMemory = 10000000;
 
+// Default connection-level flow control window (32MB) to improve throughput
+// on high-latency connections. See https://github.com/nodejs/node/issues/38426
+constexpr int32_t kDefaultConnectionWindowSize = 33554432;
+
 // These are the standard HTTP/2 defaults as specified by the RFC
 constexpr uint32_t DEFAULT_SETTINGS_HEADER_TABLE_SIZE = 4096;
 constexpr uint32_t DEFAULT_SETTINGS_ENABLE_PUSH = 1;
 constexpr uint32_t DEFAULT_SETTINGS_MAX_CONCURRENT_STREAMS = 0xffffffffu;
-constexpr uint32_t DEFAULT_SETTINGS_INITIAL_WINDOW_SIZE = 65535;
+constexpr uint32_t DEFAULT_SETTINGS_INITIAL_WINDOW_SIZE = 4194304;
 constexpr uint32_t DEFAULT_SETTINGS_MAX_FRAME_SIZE = 16384;
 constexpr uint32_t DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE = 65535;
 constexpr uint32_t DEFAULT_SETTINGS_ENABLE_CONNECT_PROTOCOL = 0;
@@ -56,6 +61,10 @@ constexpr int STREAM_OPTION_EMPTY_PAYLOAD = 0x1;
 // Stream might have trailing headers
 constexpr int STREAM_OPTION_GET_TRAILERS = 0x2;
 
+// Stream may finish with an empty DATA frame carrying END_STREAM without
+// calling back into JS, unless trailers are registered before then
+constexpr int STREAM_OPTION_AUTO_EMPTY_TRAILERS = 0x4;
+
 // Http2Stream internal states
 constexpr int kStreamStateNone = 0x0;
 constexpr int kStreamStateShut = 0x1;
@@ -64,6 +73,8 @@ constexpr int kStreamStateReadPaused = 0x4;
 constexpr int kStreamStateClosed = 0x8;
 constexpr int kStreamStateDestroyed = 0x10;
 constexpr int kStreamStateTrailers = 0x20;
+constexpr int kStreamStatePeerReset = 0x40;
+constexpr int kStreamStateAutoEmptyTrailers = 0x80;
 
 // Http2Session internal states
 constexpr int kSessionStateNone = 0x0;
@@ -74,7 +85,8 @@ constexpr int kSessionStateClosing = 0x8;
 constexpr int kSessionStateSending = 0x10;
 constexpr int kSessionStateWriteInProgress = 0x20;
 constexpr int kSessionStateReadingStopped = 0x40;
-constexpr int kSessionStateReceivePaused = 0x80;
+constexpr int kSessionStateReceiving = 0x80;
+constexpr int kSessionStateClosePending = 0x100;
 
 // The Padding Strategy determines the method by which extra padding is
 // selected for HEADERS and DATA frames. These are configurable via the
@@ -233,9 +245,16 @@ class Http2Options {
     return max_session_memory_;
   }
 
+  void set_connection_window_size(int32_t size) {
+    connection_window_size_ = size;
+  }
+
+  int32_t connection_window_size() const { return connection_window_size_; }
+
  private:
   Nghttp2OptionPointer options_;
   uint64_t max_session_memory_ = kDefaultMaxSessionMemory;
+  int32_t connection_window_size_ = kDefaultConnectionWindowSize;
   uint32_t max_header_pairs_ = DEFAULT_MAX_HEADER_LIST_PAIRS;
   PaddingStrategy padding_strategy_ = PADDING_STRATEGY_NONE;
   size_t max_outstanding_pings_ = kDefaultMaxPings;
@@ -269,6 +288,11 @@ using Http2Header = NgHeader<Http2HeaderTraits>;
 class Http2Stream : public AsyncWrap,
                     public StreamBase {
  public:
+  enum InternalFields {
+    kInternalFieldCount = std::max<uint32_t>(AsyncWrap::kInternalFieldCount,
+                                             StreamBase::kInternalFieldCount),
+  };
+
   static Http2Stream* New(
       Http2Session* session,
       int32_t id,
@@ -303,7 +327,9 @@ class Http2Stream : public AsyncWrap,
 
   // Submit trailing headers for this stream
   int SubmitTrailers(const Http2Headers& headers);
+  int SubmitEmptyTrailers();
   void OnTrailers();
+  void EmitWantTrailers();
 
   // Submit a PRIORITY frame for this stream
   int SubmitPriority(const Http2Priority& priority, bool silent = false);
@@ -325,6 +351,10 @@ class Http2Stream : public AsyncWrap,
   // Destroy this stream instance and free all held memory.
   void Destroy();
 
+  // Completes Destroy() after set_destroyed(); may run deferred until after
+  // nghttp2_session_mem_recv() returns.
+  void CompleteDestroyCleanup();
+
   bool is_destroyed() const {
     return flags_ & kStreamStateDestroyed;
   }
@@ -341,6 +371,15 @@ class Http2Stream : public AsyncWrap,
     return flags_ & kStreamStateClosed;
   }
 
+  // True iff a RST_STREAM frame was received from the peer for this stream.
+  // Set by Http2Session::OnFrameReceive on NGHTTP2_RST_STREAM. Used by JS
+  // onStreamClose to distinguish a peer-initiated reset from a clean
+  // bidirectional END_STREAM exchange (both surface to JS with the same
+  // nghttp2 close code when the peer sent RST_STREAM(NO_ERROR)).
+  bool peer_reset() const { return flags_ & kStreamStatePeerReset; }
+
+  void set_peer_reset() { flags_ |= kStreamStatePeerReset; }
+
   bool has_trailers() const {
     return flags_ & kStreamStateTrailers;
   }
@@ -350,6 +389,17 @@ class Http2Stream : public AsyncWrap,
       flags_ |= kStreamStateTrailers;
     else
       flags_ &= ~kStreamStateTrailers;
+  }
+
+  bool auto_empty_trailers() const {
+    return flags_ & kStreamStateAutoEmptyTrailers;
+  }
+
+  void set_auto_empty_trailers(bool on = true) {
+    if (on)
+      flags_ |= kStreamStateAutoEmptyTrailers;
+    else
+      flags_ &= ~kStreamStateAutoEmptyTrailers;
   }
 
   void set_closed() {
@@ -447,6 +497,8 @@ class Http2Stream : public AsyncWrap,
   static void RefreshState(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void Info(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void Trailers(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void DisableAutoTrailers(
+      const v8::FunctionCallbackInfo<v8::Value>& args);
   static void Respond(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void RstStream(const v8::FunctionCallbackInfo<v8::Value>& args);
 
@@ -484,9 +536,11 @@ class Http2Stream : public AsyncWrap,
 
   // The Current Headers block... As headers are received for this stream,
   // they are temporarily stored here until the OnFrameReceived is called
-  // signalling the end of the HEADERS frame
+  // signalling the end of the HEADERS frame.
   nghttp2_headers_category current_headers_category_ = NGHTTP2_HCAT_HEADERS;
   uint32_t current_headers_length_ = 0;  // total number of octets
+  // Charged against maxSessionMemory while headers stay alive in JS.
+  uint64_t retained_headers_length_ = 0;
   std::vector<Http2Header> current_headers_;
 
   // This keeps track of the amount of data read from the socket while the
@@ -626,6 +680,15 @@ class Http2Session : public AsyncWrap,
     flags_ |= kSessionStateClosed;
   }
 
+  struct custom_settings_state {
+    size_t number;
+    nghttp2_settings_entry entries[MAX_ADDITIONAL_SETTINGS];
+  };
+
+  custom_settings_state& custom_settings(bool local) {
+    return local ? local_custom_settings_ : remote_custom_settings_;
+  }
+
 #define IS_FLAG(name, flag)                                                    \
   bool is_##name() const { return flags_ & flag; }                             \
   void set_##name(bool on = true) {                                            \
@@ -641,7 +704,8 @@ class Http2Session : public AsyncWrap,
   IS_FLAG(sending, kSessionStateSending)
   IS_FLAG(write_in_progress, kSessionStateWriteInProgress)
   IS_FLAG(reading_stopped, kSessionStateReadingStopped)
-  IS_FLAG(receive_paused, kSessionStateReceivePaused)
+  IS_FLAG(receiving, kSessionStateReceiving)
+  IS_FLAG(close_pending, kSessionStateClosePending)
 
 #undef IS_FLAG
 
@@ -682,9 +746,11 @@ class Http2Session : public AsyncWrap,
 
   bool has_pending_rststream(int32_t stream_id) {
     return pending_rst_streams_.end() !=
-        std::find(pending_rst_streams_.begin(),
-            pending_rst_streams_.end(),
-            stream_id);
+           std::ranges::find(pending_rst_streams_, stream_id);
+  }
+
+  void RemovePendingRstStream(int32_t stream_id) {
+    std::erase(pending_rst_streams_, stream_id);
   }
 
   // Handle reads/writes from the underlying network transport.
@@ -702,6 +768,7 @@ class Http2Session : public AsyncWrap,
   static void Consume(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void Receive(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void Destroy(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void HasPendingData(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void Settings(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void Request(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void SetNextStreamID(const v8::FunctionCallbackInfo<v8::Value>& args);
@@ -713,8 +780,9 @@ class Http2Session : public AsyncWrap,
   static void Ping(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void AltSvc(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void Origin(const v8::FunctionCallbackInfo<v8::Value>& args);
+  static void SetGracefulClose(const v8::FunctionCallbackInfo<v8::Value>& args);
 
-  template <get_setting fn>
+  template <get_setting fn, bool local>
   static void RefreshSettings(const v8::FunctionCallbackInfo<v8::Value>& args);
 
   uv_loop_t* event_loop() const {
@@ -725,6 +793,8 @@ class Http2Session : public AsyncWrap,
 
   BaseObjectPtr<Http2Ping> PopPing();
   bool AddPing(const uint8_t* data, v8::Local<v8::Function> callback);
+  bool HasPendingData() const;
+  bool HasStreamsAbandonedByNghttp2() const;
 
   BaseObjectPtr<Http2Settings> PopSettings();
   bool AddSettings(v8::Local<v8::Function> callback);
@@ -736,6 +806,20 @@ class Http2Session : public AsyncWrap,
   void DecrementCurrentSessionMemory(uint64_t amount) {
     DCHECK_LE(amount, current_session_memory_);
     current_session_memory_ -= amount;
+  }
+
+  void UpdateLocalCustomSettings(size_t count_,
+                                 nghttp2_settings_entry* entries_);
+
+  void IncrementQueuedOutboundMemory(uint64_t amount) {
+    queued_outbound_memory_ += amount;
+    IncrementCurrentSessionMemory(amount);
+  }
+
+  void DecrementQueuedOutboundMemory(uint64_t amount) {
+    DCHECK_LE(amount, queued_outbound_memory_);
+    queued_outbound_memory_ -= amount;
+    DecrementCurrentSessionMemory(amount);
   }
 
   // Tell our custom memory allocator that this rcbuf is independent of
@@ -751,9 +835,17 @@ class Http2Session : public AsyncWrap,
     return total;
   }
 
-  // Return true if current_session_memory + amount is less than the max
-  bool has_available_session_memory(uint64_t amount) const {
-    return current_session_memory() + amount <= max_session_memory_;
+  // Headers on local client streams may exclude queued outbound DATA, but
+  // retained headers and all other session memory still count towards the
+  // limit.
+  bool has_available_session_memory(uint64_t amount,
+                                    bool exclude_outbound = false) const {
+    uint64_t memory = current_session_memory();
+    if (exclude_outbound) {
+      DCHECK_LE(queued_outbound_memory_, memory);
+      memory -= queued_outbound_memory_;
+    }
+    return memory + amount <= max_session_memory_;
   }
 
   struct Statistics {
@@ -772,8 +864,17 @@ class Http2Session : public AsyncWrap,
 
   Statistics statistics_ = {};
 
+  bool IsGracefulCloseInitiated() const {
+    return graceful_close_initiated_;
+  }
+  void SetGracefulCloseInitiated(bool value) {
+    graceful_close_initiated_ = value;
+  }
+
  private:
   void EmitStatistics();
+
+  void FetchAllowedRemoteCustomSettings();
 
   // Frame Padding Strategies
   ssize_t OnDWordAlignedPadding(size_t frameLength,
@@ -842,11 +943,11 @@ class Http2Session : public AsyncWrap,
       const nghttp2_frame* frame,
       size_t maxPayloadLen,
       void* user_data);
-  static int OnNghttpError(
-      nghttp2_session* session,
-      const char* message,
-      size_t len,
-      void* user_data);
+  static int OnNghttpError(nghttp2_session* session,
+                           int lib_error_code,
+                           const char* message,
+                           size_t len,
+                           void* user_data);
   static int OnSendData(
       nghttp2_session* session,
       nghttp2_frame* frame,
@@ -884,6 +985,8 @@ class Http2Session : public AsyncWrap,
   // The maximum amount of memory allocated for this session
   uint64_t max_session_memory_ = kDefaultMaxSessionMemory;
   uint64_t current_session_memory_ = 0;
+  // Part of current_session_memory_: DATA not yet consumed by nghttp2.
+  uint64_t queued_outbound_memory_ = 0;
   // The amount of memory allocated by nghttp2 internals
   uint64_t current_nghttp2_memory_ = 0;
 
@@ -903,7 +1006,6 @@ class Http2Session : public AsyncWrap,
   // will be set. stream_buf_ab_ is lazily created from stream_buf_allocation_.
   v8::Global<v8::ArrayBuffer> stream_buf_ab_;
   std::unique_ptr<v8::BackingStore> stream_buf_allocation_;
-  size_t stream_buf_offset_ = 0;
   // Custom error code for errors that originated inside one of the callbacks
   // called by nghttp2_session_mem_recv.
   const char* custom_recv_error_code_ = nullptr;
@@ -914,10 +1016,17 @@ class Http2Session : public AsyncWrap,
   size_t max_outstanding_settings_ = kDefaultMaxSettings;
   std::queue<BaseObjectPtr<Http2Settings>> outstanding_settings_;
 
+  struct custom_settings_state local_custom_settings_;
+  struct custom_settings_state remote_custom_settings_;
+
   std::vector<NgHttp2StreamWrite> outgoing_buffers_;
   std::vector<uint8_t> outgoing_storage_;
   size_t outgoing_length_ = 0;
   std::vector<int32_t> pending_rst_streams_;
+  // Saved arguments for Close() deferred while nghttp2_session_mem_recv()
+  // callbacks are active.
+  uint32_t pending_close_code_ = NGHTTP2_NO_ERROR;
+  bool pending_close_socket_closed_ = false;
   // Count streams that have been rejected while being opened. Exceeding a fixed
   // limit will result in the session being destroyed, as an indication of a
   // misbehaving peer. This counter is reset once new streams are being
@@ -932,9 +1041,18 @@ class Http2Session : public AsyncWrap,
 
   void CopyDataIntoOutgoing(const uint8_t* src, size_t src_length);
   void ClearOutgoing(int status);
+  void FinishClose(uint32_t code, bool socket_closed);
+  void MaybeFinishPendingClose();
+
+  void MaybeNotifyGracefulCloseComplete();
 
   friend class Http2Scope;
   friend class Http2StreamListener;
+
+  // Flag to indicate that JavaScript has initiated a graceful closure
+  bool graceful_close_initiated_ = false;
+  bool goaway_initiated_ = false;
+  bool internal_goaway_sent_ = false;
 };
 
 struct Http2SessionPerformanceEntryTraits {
@@ -1017,8 +1135,7 @@ class Http2Settings : public AsyncWrap {
   static void RefreshDefaults(Http2State* http2_state);
 
   // Update the local or remote settings for the given session
-  static void Update(Http2Session* session,
-                     get_setting fn);
+  static void Update(Http2Session* session, get_setting fn, bool local);
 
  private:
   static size_t Init(
@@ -1034,7 +1151,7 @@ class Http2Settings : public AsyncWrap {
   v8::Global<v8::Function> callback_;
   uint64_t startTime_;
   size_t count_ = 0;
-  nghttp2_settings_entry entries_[IDX_SETTINGS_COUNT];
+  nghttp2_settings_entry entries_[IDX_SETTINGS_COUNT + MAX_ADDITIONAL_SETTINGS];
 };
 
 class Origins {
@@ -1070,7 +1187,8 @@ class Origins {
   V(NGHTTP2_ERR_STREAM_CLOSED)                                                 \
   V(NGHTTP2_ERR_NOMEM)                                                         \
   V(STREAM_OPTION_EMPTY_PAYLOAD)                                               \
-  V(STREAM_OPTION_GET_TRAILERS)
+  V(STREAM_OPTION_GET_TRAILERS)                                                \
+  V(STREAM_OPTION_AUTO_EMPTY_TRAILERS)
 
 #define HTTP2_ERROR_CODES(V)                                                   \
   V(NGHTTP2_NO_ERROR)                                                          \

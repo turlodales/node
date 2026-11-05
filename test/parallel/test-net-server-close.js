@@ -26,16 +26,16 @@ const net = require('net');
 
 const sockets = [];
 
-const server = net.createServer(function(c) {
+const server = net.createServer(common.mustCallAtLeast((c) => {
   c.on('close', common.mustCall());
 
   sockets.push(c);
 
   if (sockets.length === 2) {
     assert.strictEqual(server.close(), server);
-    sockets.forEach((c) => c.destroy());
+    for (const c of sockets) { c.destroy(); }
   }
-});
+}));
 
 server.on('close', common.mustCall());
 

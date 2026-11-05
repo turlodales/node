@@ -64,6 +64,7 @@ server.listen(0, common.mustCall(() => {
         console.error('write again');
         sent += bufSize;
         assert.ok(sent < 100 * 1024 * 1024); // max 100MB
+        // eslint-disable-next-line no-use-before-define
         return process.nextTick(send);
       }
       sent += bufSize;
@@ -73,7 +74,7 @@ server.listen(0, common.mustCall(() => {
       console.error('resumed', client);
     })();
   }));
-  client.on('data', (data) => {
+  client.on('data', common.mustCallAtLeast((data) => {
     console.error('data');
     assert.ok(resumed);
     received += data.length;
@@ -84,7 +85,7 @@ server.listen(0, common.mustCall(() => {
       client.end();
       server.close();
     }
-  });
+  }));
 }));
 
 process.on('exit', () => {

@@ -1,30 +1,35 @@
 'use strict';
 const common = require('../common');
+const { addresses } = require('../common/internet');
 const assert = require('assert');
 const http = require('http');
 const net = require('net');
 const dc = require('diagnostics_channel');
 
-const onClientRequestStart = dc.channel('http.client.request.start');
-const onClientResponseFinish = dc.channel('http.client.response.finish');
-const onServerRequestStart = dc.channel('http.server.request.start');
-const onServerResponseFinish = dc.channel('http.server.response.finish');
-
 const isHTTPServer = (server) => server instanceof http.Server;
 const isIncomingMessage = (object) => object instanceof http.IncomingMessage;
 const isOutgoingMessage = (object) => object instanceof http.OutgoingMessage;
 const isNetSocket = (socket) => socket instanceof net.Socket;
+const isError = (error) => error instanceof Error;
 
-onClientRequestStart.subscribe(common.mustCall(({ request }) => {
+dc.subscribe('http.client.request.start', common.mustCall(({ request }) => {
   assert.strictEqual(isOutgoingMessage(request), true);
+}, 2));
+
+dc.subscribe('http.client.request.error', common.mustCall(({ request, error }) => {
+  assert.strictEqual(isOutgoingMessage(request), true);
+  assert.strictEqual(isError(error), true);
 }));
 
-onClientResponseFinish.subscribe(common.mustCall(({ request, response }) => {
+dc.subscribe('http.client.response.finish', common.mustCall(({
+  request,
+  response
+}) => {
   assert.strictEqual(isOutgoingMessage(request), true);
   assert.strictEqual(isIncomingMessage(response), true);
 }));
 
-onServerRequestStart.subscribe(common.mustCall(({
+dc.subscribe('http.server.request.start', common.mustCall(({
   request,
   response,
   socket,
@@ -36,7 +41,7 @@ onServerRequestStart.subscribe(common.mustCall(({
   assert.strictEqual(isHTTPServer(server), true);
 }));
 
-onServerResponseFinish.subscribe(common.mustCall(({
+dc.subscribe('http.server.response.finish', common.mustCall(({
   request,
   response,
   socket,
@@ -47,13 +52,32 @@ onServerResponseFinish.subscribe(common.mustCall(({
   assert.strictEqual(isNetSocket(socket), true);
   assert.strictEqual(isHTTPServer(server), true);
 }));
+
+dc.subscribe('http.server.response.created', common.mustCall(({
+  request,
+  response,
+}) => {
+  assert.strictEqual(isIncomingMessage(request), true);
+  assert.strictEqual(isOutgoingMessage(response), true);
+}));
+
+dc.subscribe('http.client.request.created', common.mustCall(({ request }) => {
+  assert.strictEqual(isOutgoingMessage(request), true);
+  assert.strictEqual(isHTTPServer(server), true);
+}, 2));
 
 const server = http.createServer(common.mustCall((req, res) => {
   res.end('done');
 }));
 
-server.listen(() => {
+server.listen(async () => {
   const { port } = server.address();
+  const invalidRequest = http.get({
+    host: addresses.INVALID_HOST,
+  });
+  await new Promise((resolve) => {
+    invalidRequest.on('error', resolve);
+  });
   http.get(`http://localhost:${port}`, (res) => {
     res.resume();
     res.on('end', () => {

@@ -4,15 +4,15 @@ if (!common.hasCrypto)
   common.skip('missing crypto');
 const assert = require('assert');
 const http2 = require('http2');
-const makeDuplexPair = require('../common/duplexpair');
-const { Worker, parentPort } = require('worker_threads');
+const { duplexPair } = require('stream');
+const { parentPort, Worker } = require('worker_threads');
 
 // This test ensures that workers can be terminated without error while
 // stream activity is ongoing, in particular the C++ function
 // ReportWritesToJSStreamListener::OnStreamAfterReqFinished.
 
-const MAX_ITERATIONS = 20;
-const MAX_THREADS = 10;
+const MAX_ITERATIONS = 5;
+const MAX_THREADS = 6;
 
 // Do not use isMainThread so that this test itself can be run inside a Worker.
 if (!process.env.HAS_STARTED_WORKER) {
@@ -46,7 +46,7 @@ if (!process.env.HAS_STARTED_WORKER) {
     stream.end('');
   });
 
-  const { clientSide, serverSide } = makeDuplexPair();
+  const [ clientSide, serverSide ] = duplexPair();
   server.emit('connection', serverSide);
 
   const client = http2.connect('http://localhost:80', {

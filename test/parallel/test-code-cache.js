@@ -5,15 +5,16 @@
 // and the cache is used when built in modules are compiled.
 // Otherwise, verifies that no cache is used when compiling builtins.
 
-const { isMainThread } = require('../common');
+require('../common');
+const { isMainThread } = require('worker_threads');
 const assert = require('assert');
 const {
   internalBinding
 } = require('internal/test/binding');
 const {
   getCacheUsage,
-  moduleCategories: { canBeRequired, cannotBeRequired }
-} = internalBinding('native_module');
+  builtinCategories: { canBeRequired }
+} = internalBinding('builtins');
 
 for (const key of canBeRequired) {
   require(`node:${key}`);
@@ -54,20 +55,12 @@ if (!process.features.cached_builtins) {
 } else {  // Native compiled
   assert(process.config.variables.node_use_node_code_cache);
 
-  if (!isMainThread) {
-    for (const key of [ 'internal/bootstrap/pre_execution' ]) {
-      canBeRequired.add(key);
-      cannotBeRequired.delete(key);
-    }
-  }
-
   const wrong = [];
   for (const key of loadedModules) {
-    if (cannotBeRequired.has(key) && !compiledWithoutCache.has(key)) {
-      wrong.push(`"${key}" should've been compiled **without** code cache`);
+    if (key.startsWith('internal/deps/v8/tools')) {
+      continue;
     }
-    if (canBeRequired.has(key) &&
-      !compiledWithCache.has(key) &&
+    if (!compiledWithCache.has(key) &&
       compiledInSnapshot.indexOf(key) === -1) {
       wrong.push(`"${key}" should've been compiled **with** code cache`);
     }

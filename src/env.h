@@ -30,23 +30,33 @@
 #include "inspector_profiler.h"
 #endif
 #include "callback_queue.h"
+#include "cleanup_queue-inl.h"
+#include "compile_cache.h"
 #include "debug_utils.h"
+#include "env_properties.h"
 #include "handle_wrap.h"
 #include "node.h"
 #include "node_binding.h"
+#include "node_builtins.h"
+#include "node_exit_code.h"
 #include "node_main_instance.h"
-#include "node_native_module.h"
 #include "node_options.h"
 #include "node_perf_common.h"
+#include "node_profiling.h"
+#include "node_realm.h"
 #include "node_snapshotable.h"
+#include "permission/permission.h"
 #include "req_wrap.h"
 #include "util.h"
 #include "uv.h"
+#include "v8-external-memory-accounter.h"
+#include "v8-profiler.h"
 #include "v8.h"
 
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <list>
 #include <memory>
@@ -55,10 +65,27 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
+
+namespace ncrypto {
+class CipherCache;
+class DigestCache;
+class MacCache;
+}  // namespace ncrypto
 
 namespace node {
 
+#if HAVE_OPENSSL
+namespace crypto {
+struct RootCertStore;
+void FreeRootCertStore(RootCertStore* root_certs);
+}  // namespace crypto
+#endif  // HAVE_OPENSSL
+
+namespace shadow_realm {
+class ShadowRealm;
+}
 namespace contextify {
 class ContextifyScript;
 class CompiledFnEntry;
@@ -90,499 +117,10 @@ class Worker;
 
 namespace loader {
 class ModuleWrap;
-
-struct PackageConfig {
-  enum class Exists { Yes, No };
-  enum class IsValid { Yes, No };
-  enum class HasMain { Yes, No };
-  enum class HasName { Yes, No };
-  enum PackageType : uint32_t { None = 0, CommonJS, Module };
-
-  const Exists exists;
-  const IsValid is_valid;
-  const HasMain has_main;
-  const std::string main;
-  const HasName has_name;
-  const std::string name;
-  const PackageType type;
-
-  v8::Global<v8::Value> exports;
-};
 }  // namespace loader
 
-enum class FsStatsOffset {
-  kDev = 0,
-  kMode,
-  kNlink,
-  kUid,
-  kGid,
-  kRdev,
-  kBlkSize,
-  kIno,
-  kSize,
-  kBlocks,
-  kATimeSec,
-  kATimeNsec,
-  kMTimeSec,
-  kMTimeNsec,
-  kCTimeSec,
-  kCTimeNsec,
-  kBirthTimeSec,
-  kBirthTimeNsec,
-  kFsStatsFieldsNumber
-};
-
-// Stat fields buffers contain twice the number of entries in an uv_stat_t
-// because `fs.StatWatcher` needs room to store 2 `fs.Stats` instances.
-constexpr size_t kFsStatsBufferLength =
-    static_cast<size_t>(FsStatsOffset::kFsStatsFieldsNumber) * 2;
-
-// Disables zero-filling for ArrayBuffer allocations in this scope. This is
-// similar to how we implement Buffer.allocUnsafe() in JS land.
-class NoArrayBufferZeroFillScope {
- public:
-  inline explicit NoArrayBufferZeroFillScope(IsolateData* isolate_data);
-  inline ~NoArrayBufferZeroFillScope();
-
- private:
-  NodeArrayBufferAllocator* node_allocator_;
-
-  friend class Environment;
-};
-
-// PER_ISOLATE_* macros: We have a lot of per-isolate properties
-// and adding and maintaining their getters and setters by hand would be
-// difficult so let's make the preprocessor generate them for us.
-//
-// In each macro, `V` is expected to be the name of a macro or function which
-// accepts the number of arguments provided in each tuple in the macro body,
-// typically two. The named function will be invoked against each tuple.
-//
-// Make sure that any macro V defined for use with the PER_ISOLATE_* macros is
-// undefined again after use.
-
-// Private symbols are per-isolate primitives but Environment proxies them
-// for the sake of convenience.  Strings should be ASCII-only and have a
-// "node:" prefix to avoid name clashes with third-party code.
-#define PER_ISOLATE_PRIVATE_SYMBOL_PROPERTIES(V)                               \
-  V(alpn_buffer_private_symbol, "node:alpnBuffer")                             \
-  V(arrow_message_private_symbol, "node:arrowMessage")                         \
-  V(contextify_context_private_symbol, "node:contextify:context")              \
-  V(contextify_global_private_symbol, "node:contextify:global")                \
-  V(decorated_private_symbol, "node:decorated")                                \
-  V(napi_type_tag, "node:napi:type_tag")                                       \
-  V(napi_wrapper, "node:napi:wrapper")                                         \
-  V(untransferable_object_private_symbol, "node:untransferableObject")         \
-  V(exiting_aliased_Uint32Array, "node:exiting_aliased_Uint32Array")
-
-// Symbols are per-isolate primitives but Environment proxies them
-// for the sake of convenience.
-#define PER_ISOLATE_SYMBOL_PROPERTIES(V)                                       \
-  V(async_id_symbol, "async_id_symbol")                                        \
-  V(handle_onclose_symbol, "handle_onclose")                                   \
-  V(no_message_symbol, "no_message_symbol")                                    \
-  V(messaging_deserialize_symbol, "messaging_deserialize_symbol")              \
-  V(messaging_transfer_symbol, "messaging_transfer_symbol")                    \
-  V(messaging_clone_symbol, "messaging_clone_symbol")                          \
-  V(messaging_transfer_list_symbol, "messaging_transfer_list_symbol")          \
-  V(oninit_symbol, "oninit")                                                   \
-  V(owner_symbol, "owner_symbol")                                              \
-  V(onpskexchange_symbol, "onpskexchange")                                     \
-  V(resource_symbol, "resource_symbol")                                        \
-  V(trigger_async_id_symbol, "trigger_async_id_symbol")                        \
-
-// Strings are per-isolate primitives but Environment proxies them
-// for the sake of convenience.  Strings should be ASCII-only.
-#define PER_ISOLATE_STRING_PROPERTIES(V)                                       \
-  V(ack_string, "ack")                                                         \
-  V(address_string, "address")                                                 \
-  V(aliases_string, "aliases")                                                 \
-  V(args_string, "args")                                                       \
-  V(asn1curve_string, "asn1Curve")                                             \
-  V(async_ids_stack_string, "async_ids_stack")                                 \
-  V(bits_string, "bits")                                                       \
-  V(block_list_string, "blockList")                                            \
-  V(buffer_string, "buffer")                                                   \
-  V(bytes_parsed_string, "bytesParsed")                                        \
-  V(bytes_read_string, "bytesRead")                                            \
-  V(bytes_written_string, "bytesWritten")                                      \
-  V(cached_data_produced_string, "cachedDataProduced")                         \
-  V(cached_data_rejected_string, "cachedDataRejected")                         \
-  V(cached_data_string, "cachedData")                                          \
-  V(cache_key_string, "cacheKey")                                              \
-  V(change_string, "change")                                                   \
-  V(channel_string, "channel")                                                 \
-  V(chunks_sent_since_last_write_string, "chunksSentSinceLastWrite")           \
-  V(clone_unsupported_type_str, "Cannot transfer object of unsupported type.") \
-  V(code_string, "code")                                                       \
-  V(commonjs_string, "commonjs")                                               \
-  V(config_string, "config")                                                   \
-  V(constants_string, "constants")                                             \
-  V(crypto_dh_string, "dh")                                                    \
-  V(crypto_dsa_string, "dsa")                                                  \
-  V(crypto_ec_string, "ec")                                                    \
-  V(crypto_ed25519_string, "ed25519")                                          \
-  V(crypto_ed448_string, "ed448")                                              \
-  V(crypto_x25519_string, "x25519")                                            \
-  V(crypto_x448_string, "x448")                                                \
-  V(crypto_rsa_string, "rsa")                                                  \
-  V(crypto_rsa_pss_string, "rsa-pss")                                          \
-  V(cwd_string, "cwd")                                                         \
-  V(data_string, "data")                                                       \
-  V(default_is_true_string, "defaultIsTrue")                                   \
-  V(deserialize_info_string, "deserializeInfo")                                \
-  V(dest_string, "dest")                                                       \
-  V(destroyed_string, "destroyed")                                             \
-  V(detached_string, "detached")                                               \
-  V(dh_string, "DH")                                                           \
-  V(divisor_length_string, "divisorLength")                                    \
-  V(dns_a_string, "A")                                                         \
-  V(dns_aaaa_string, "AAAA")                                                   \
-  V(dns_caa_string, "CAA")                                                     \
-  V(dns_critical_string, "critical")                                           \
-  V(dns_cname_string, "CNAME")                                                 \
-  V(dns_mx_string, "MX")                                                       \
-  V(dns_naptr_string, "NAPTR")                                                 \
-  V(dns_ns_string, "NS")                                                       \
-  V(dns_ptr_string, "PTR")                                                     \
-  V(dns_soa_string, "SOA")                                                     \
-  V(dns_srv_string, "SRV")                                                     \
-  V(dns_txt_string, "TXT")                                                     \
-  V(done_string, "done")                                                       \
-  V(duration_string, "duration")                                               \
-  V(ecdh_string, "ECDH")                                                       \
-  V(emit_string, "emit")                                                       \
-  V(emit_warning_string, "emitWarning")                                        \
-  V(empty_object_string, "{}")                                                 \
-  V(encoding_string, "encoding")                                               \
-  V(entries_string, "entries")                                                 \
-  V(entry_type_string, "entryType")                                            \
-  V(env_pairs_string, "envPairs")                                              \
-  V(env_var_settings_string, "envVarSettings")                                 \
-  V(errno_string, "errno")                                                     \
-  V(error_string, "error")                                                     \
-  V(exchange_string, "exchange")                                               \
-  V(exit_code_string, "exitCode")                                              \
-  V(expire_string, "expire")                                                   \
-  V(exponent_string, "exponent")                                               \
-  V(exports_string, "exports")                                                 \
-  V(ext_key_usage_string, "ext_key_usage")                                     \
-  V(external_stream_string, "_externalStream")                                 \
-  V(family_string, "family")                                                   \
-  V(fatal_exception_string, "_fatalException")                                 \
-  V(fd_string, "fd")                                                           \
-  V(fields_string, "fields")                                                   \
-  V(file_string, "file")                                                       \
-  V(filename_string, "filename")                                               \
-  V(fingerprint256_string, "fingerprint256")                                   \
-  V(fingerprint512_string, "fingerprint512")                                   \
-  V(fingerprint_string, "fingerprint")                                         \
-  V(flags_string, "flags")                                                     \
-  V(flowlabel_string, "flowlabel")                                             \
-  V(fragment_string, "fragment")                                               \
-  V(frames_received_string, "framesReceived")                                  \
-  V(frames_sent_string, "framesSent")                                          \
-  V(function_string, "function")                                               \
-  V(get_data_clone_error_string, "_getDataCloneError")                         \
-  V(get_shared_array_buffer_id_string, "_getSharedArrayBufferId")              \
-  V(gid_string, "gid")                                                         \
-  V(h2_string, "h2")                                                           \
-  V(handle_string, "handle")                                                   \
-  V(hash_algorithm_string, "hashAlgorithm")                                    \
-  V(help_text_string, "helpText")                                              \
-  V(homedir_string, "homedir")                                                 \
-  V(host_string, "host")                                                       \
-  V(hostmaster_string, "hostmaster")                                           \
-  V(http_1_1_string, "http/1.1")                                               \
-  V(id_string, "id")                                                           \
-  V(identity_string, "identity")                                               \
-  V(ignore_string, "ignore")                                                   \
-  V(infoaccess_string, "infoAccess")                                           \
-  V(inherit_string, "inherit")                                                 \
-  V(input_string, "input")                                                     \
-  V(internal_binding_string, "internalBinding")                                \
-  V(internal_string, "internal")                                               \
-  V(ipv4_string, "IPv4")                                                       \
-  V(ipv6_string, "IPv6")                                                       \
-  V(isclosing_string, "isClosing")                                             \
-  V(issuer_string, "issuer")                                                   \
-  V(issuercert_string, "issuerCertificate")                                    \
-  V(jwk_crv_string, "crv")                                                     \
-  V(jwk_d_string, "d")                                                         \
-  V(jwk_dp_string, "dp")                                                       \
-  V(jwk_dq_string, "dq")                                                       \
-  V(jwk_dsa_string, "DSA")                                                     \
-  V(jwk_e_string, "e")                                                         \
-  V(jwk_ec_string, "EC")                                                       \
-  V(jwk_g_string, "g")                                                         \
-  V(jwk_k_string, "k")                                                         \
-  V(jwk_p_string, "p")                                                         \
-  V(jwk_q_string, "q")                                                         \
-  V(jwk_qi_string, "qi")                                                       \
-  V(jwk_kty_string, "kty")                                                     \
-  V(jwk_n_string, "n")                                                         \
-  V(jwk_oct_string, "oct")                                                     \
-  V(jwk_okp_string, "OKP")                                                     \
-  V(jwk_rsa_string, "RSA")                                                     \
-  V(jwk_x_string, "x")                                                         \
-  V(jwk_y_string, "y")                                                         \
-  V(kill_signal_string, "killSignal")                                          \
-  V(kind_string, "kind")                                                       \
-  V(length_string, "length")                                                   \
-  V(library_string, "library")                                                 \
-  V(mac_string, "mac")                                                         \
-  V(max_buffer_string, "maxBuffer")                                            \
-  V(max_concurrent_streams_string, "maxConcurrentStreams")                     \
-  V(message_port_constructor_string, "MessagePort")                            \
-  V(message_port_string, "messagePort")                                        \
-  V(message_string, "message")                                                 \
-  V(messageerror_string, "messageerror")                                       \
-  V(mgf1_hash_algorithm_string, "mgf1HashAlgorithm")                           \
-  V(minttl_string, "minttl")                                                   \
-  V(module_string, "module")                                                   \
-  V(modulus_string, "modulus")                                                 \
-  V(modulus_length_string, "modulusLength")                                    \
-  V(name_string, "name")                                                       \
-  V(named_curve_string, "namedCurve")                                          \
-  V(netmask_string, "netmask")                                                 \
-  V(next_string, "next")                                                       \
-  V(nistcurve_string, "nistCurve")                                             \
-  V(node_string, "node")                                                       \
-  V(nsname_string, "nsname")                                                   \
-  V(ocsp_request_string, "OCSPRequest")                                        \
-  V(oncertcb_string, "oncertcb")                                               \
-  V(onchange_string, "onchange")                                               \
-  V(onclienthello_string, "onclienthello")                                     \
-  V(oncomplete_string, "oncomplete")                                           \
-  V(onconnection_string, "onconnection")                                       \
-  V(ondone_string, "ondone")                                                   \
-  V(onerror_string, "onerror")                                                 \
-  V(onexit_string, "onexit")                                                   \
-  V(onhandshakedone_string, "onhandshakedone")                                 \
-  V(onhandshakestart_string, "onhandshakestart")                               \
-  V(onkeylog_string, "onkeylog")                                               \
-  V(onmessage_string, "onmessage")                                             \
-  V(onnewsession_string, "onnewsession")                                       \
-  V(onocspresponse_string, "onocspresponse")                                   \
-  V(onreadstart_string, "onreadstart")                                         \
-  V(onreadstop_string, "onreadstop")                                           \
-  V(onshutdown_string, "onshutdown")                                           \
-  V(onsignal_string, "onsignal")                                               \
-  V(onunpipe_string, "onunpipe")                                               \
-  V(onwrite_string, "onwrite")                                                 \
-  V(openssl_error_stack, "opensslErrorStack")                                  \
-  V(options_string, "options")                                                 \
-  V(order_string, "order")                                                     \
-  V(output_string, "output")                                                   \
-  V(overlapped_string, "overlapped")                                           \
-  V(parse_error_string, "Parse Error")                                         \
-  V(password_string, "password")                                               \
-  V(path_string, "path")                                                       \
-  V(pending_handle_string, "pendingHandle")                                    \
-  V(pid_string, "pid")                                                         \
-  V(ping_rtt_string, "pingRTT")                                                \
-  V(pipe_source_string, "pipeSource")                                          \
-  V(pipe_string, "pipe")                                                       \
-  V(pipe_target_string, "pipeTarget")                                          \
-  V(port1_string, "port1")                                                     \
-  V(port2_string, "port2")                                                     \
-  V(port_string, "port")                                                       \
-  V(preference_string, "preference")                                           \
-  V(primordials_string, "primordials")                                         \
-  V(priority_string, "priority")                                               \
-  V(process_string, "process")                                                 \
-  V(promise_string, "promise")                                                 \
-  V(psk_string, "psk")                                                         \
-  V(pubkey_string, "pubkey")                                                   \
-  V(public_exponent_string, "publicExponent")                                  \
-  V(query_string, "query")                                                     \
-  V(rate_string, "rate")                                                       \
-  V(raw_string, "raw")                                                         \
-  V(read_host_object_string, "_readHostObject")                                \
-  V(readable_string, "readable")                                               \
-  V(reason_string, "reason")                                                   \
-  V(refresh_string, "refresh")                                                 \
-  V(regexp_string, "regexp")                                                   \
-  V(rename_string, "rename")                                                   \
-  V(replacement_string, "replacement")                                         \
-  V(require_string, "require")                                                 \
-  V(retry_string, "retry")                                                     \
-  V(salt_length_string, "saltLength")                                          \
-  V(scheme_string, "scheme")                                                   \
-  V(scopeid_string, "scopeid")                                                 \
-  V(serial_number_string, "serialNumber")                                      \
-  V(serial_string, "serial")                                                   \
-  V(servername_string, "servername")                                           \
-  V(service_string, "service")                                                 \
-  V(session_id_string, "sessionId")                                            \
-  V(shell_string, "shell")                                                     \
-  V(signal_string, "signal")                                                   \
-  V(sink_string, "sink")                                                       \
-  V(size_string, "size")                                                       \
-  V(sni_context_err_string, "Invalid SNI context")                             \
-  V(sni_context_string, "sni_context")                                         \
-  V(source_string, "source")                                                   \
-  V(stack_string, "stack")                                                     \
-  V(standard_name_string, "standardName")                                      \
-  V(start_time_string, "startTime")                                            \
-  V(state_string, "state")                                                     \
-  V(stats_string, "stats")                                                     \
-  V(status_string, "status")                                                   \
-  V(stdio_string, "stdio")                                                     \
-  V(stream_average_duration_string, "streamAverageDuration")                   \
-  V(stream_count_string, "streamCount")                                        \
-  V(subject_string, "subject")                                                 \
-  V(subjectaltname_string, "subjectaltname")                                   \
-  V(syscall_string, "syscall")                                                 \
-  V(target_string, "target")                                                   \
-  V(thread_id_string, "threadId")                                              \
-  V(ticketkeycallback_string, "onticketkeycallback")                           \
-  V(timeout_string, "timeout")                                                 \
-  V(time_to_first_byte_string, "timeToFirstByte")                              \
-  V(time_to_first_byte_sent_string, "timeToFirstByteSent")                     \
-  V(time_to_first_header_string, "timeToFirstHeader")                          \
-  V(tls_ticket_string, "tlsTicket")                                            \
-  V(transfer_string, "transfer")                                               \
-  V(ttl_string, "ttl")                                                         \
-  V(type_string, "type")                                                       \
-  V(uid_string, "uid")                                                         \
-  V(unknown_string, "<unknown>")                                               \
-  V(url_special_ftp_string, "ftp:")                                            \
-  V(url_special_file_string, "file:")                                          \
-  V(url_special_http_string, "http:")                                          \
-  V(url_special_https_string, "https:")                                        \
-  V(url_special_ws_string, "ws:")                                              \
-  V(url_special_wss_string, "wss:")                                            \
-  V(url_string, "url")                                                         \
-  V(username_string, "username")                                               \
-  V(valid_from_string, "valid_from")                                           \
-  V(valid_to_string, "valid_to")                                               \
-  V(value_string, "value")                                                     \
-  V(verify_error_string, "verifyError")                                        \
-  V(version_string, "version")                                                 \
-  V(weight_string, "weight")                                                   \
-  V(windows_hide_string, "windowsHide")                                        \
-  V(windows_verbatim_arguments_string, "windowsVerbatimArguments")             \
-  V(wrap_string, "wrap")                                                       \
-  V(writable_string, "writable")                                               \
-  V(write_host_object_string, "_writeHostObject")                              \
-  V(write_queue_size_string, "writeQueueSize")                                 \
-  V(x_forwarded_string, "x-forwarded-for")                                     \
-  V(zero_return_string, "ZERO_RETURN")
-
-#define PER_ISOLATE_TEMPLATE_PROPERTIES(V)                                     \
-  V(async_wrap_ctor_template, v8::FunctionTemplate)                            \
-  V(async_wrap_object_ctor_template, v8::FunctionTemplate)                     \
-  V(base_object_ctor_template, v8::FunctionTemplate)                           \
-  V(binding_data_ctor_template, v8::FunctionTemplate)                          \
-  V(blob_constructor_template, v8::FunctionTemplate)                           \
-  V(blocklist_constructor_template, v8::FunctionTemplate)                      \
-  V(compiled_fn_entry_template, v8::ObjectTemplate)                            \
-  V(dir_instance_template, v8::ObjectTemplate)                                 \
-  V(fd_constructor_template, v8::ObjectTemplate)                               \
-  V(fdclose_constructor_template, v8::ObjectTemplate)                          \
-  V(filehandlereadwrap_template, v8::ObjectTemplate)                           \
-  V(fsreqpromise_constructor_template, v8::ObjectTemplate)                     \
-  V(handle_wrap_ctor_template, v8::FunctionTemplate)                           \
-  V(histogram_ctor_template, v8::FunctionTemplate)                             \
-  V(http2settings_constructor_template, v8::ObjectTemplate)                    \
-  V(http2stream_constructor_template, v8::ObjectTemplate)                      \
-  V(http2ping_constructor_template, v8::ObjectTemplate)                        \
-  V(i18n_converter_template, v8::ObjectTemplate)                               \
-  V(intervalhistogram_constructor_template, v8::FunctionTemplate)              \
-  V(libuv_stream_wrap_ctor_template, v8::FunctionTemplate)                     \
-  V(message_port_constructor_template, v8::FunctionTemplate)                   \
-  V(microtask_queue_ctor_template, v8::FunctionTemplate)                       \
-  V(pipe_constructor_template, v8::FunctionTemplate)                           \
-  V(promise_wrap_template, v8::ObjectTemplate)                                 \
-  V(sab_lifetimepartner_constructor_template, v8::FunctionTemplate)            \
-  V(script_context_constructor_template, v8::FunctionTemplate)                 \
-  V(secure_context_constructor_template, v8::FunctionTemplate)                 \
-  V(shutdown_wrap_template, v8::ObjectTemplate)                                \
-  V(socketaddress_constructor_template, v8::FunctionTemplate)                  \
-  V(streambaseoutputstream_constructor_template, v8::ObjectTemplate)           \
-  V(qlogoutputstream_constructor_template, v8::ObjectTemplate)                 \
-  V(tcp_constructor_template, v8::FunctionTemplate)                            \
-  V(tty_constructor_template, v8::FunctionTemplate)                            \
-  V(write_wrap_template, v8::ObjectTemplate)                                   \
-  V(worker_heap_snapshot_taker_template, v8::ObjectTemplate)                   \
-  V(x509_constructor_template, v8::FunctionTemplate)
-
-#define ENVIRONMENT_STRONG_PERSISTENT_VALUES(V)                                \
-  V(async_hooks_after_function, v8::Function)                                  \
-  V(async_hooks_before_function, v8::Function)                                 \
-  V(async_hooks_callback_trampoline, v8::Function)                             \
-  V(async_hooks_binding, v8::Object)                                           \
-  V(async_hooks_destroy_function, v8::Function)                                \
-  V(async_hooks_init_function, v8::Function)                                   \
-  V(async_hooks_promise_resolve_function, v8::Function)                        \
-  V(buffer_prototype_object, v8::Object)                                       \
-  V(crypto_key_object_constructor, v8::Function)                               \
-  V(crypto_key_object_handle_constructor, v8::Function)                        \
-  V(crypto_key_object_private_constructor, v8::Function)                       \
-  V(crypto_key_object_public_constructor, v8::Function)                        \
-  V(crypto_key_object_secret_constructor, v8::Function)                        \
-  V(domexception_function, v8::Function)                                       \
-  V(enhance_fatal_stack_after_inspector, v8::Function)                         \
-  V(enhance_fatal_stack_before_inspector, v8::Function)                        \
-  V(fs_use_promises_symbol, v8::Symbol)                                        \
-  V(get_source_map_error_source, v8::Function)                                 \
-  V(host_import_module_dynamically_callback, v8::Function)                     \
-  V(host_initialize_import_meta_object_callback, v8::Function)                 \
-  V(http2session_on_altsvc_function, v8::Function)                             \
-  V(http2session_on_error_function, v8::Function)                              \
-  V(http2session_on_frame_error_function, v8::Function)                        \
-  V(http2session_on_goaway_data_function, v8::Function)                        \
-  V(http2session_on_headers_function, v8::Function)                            \
-  V(http2session_on_origin_function, v8::Function)                             \
-  V(http2session_on_ping_function, v8::Function)                               \
-  V(http2session_on_priority_function, v8::Function)                           \
-  V(http2session_on_settings_function, v8::Function)                           \
-  V(http2session_on_stream_close_function, v8::Function)                       \
-  V(http2session_on_stream_trailers_function, v8::Function)                    \
-  V(internal_binding_loader, v8::Function)                                     \
-  V(immediate_callback_function, v8::Function)                                 \
-  V(inspector_console_extension_installer, v8::Function)                       \
-  V(inspector_disable_async_hooks, v8::Function)                               \
-  V(inspector_enable_async_hooks, v8::Function)                                \
-  V(maybe_cache_generated_source_map, v8::Function)                            \
-  V(messaging_deserialize_create_object, v8::Function)                         \
-  V(message_port, v8::Object)                                                  \
-  V(native_module_require, v8::Function)                                       \
-  V(performance_entry_callback, v8::Function)                                  \
-  V(performance_entry_template, v8::Function)                                  \
-  V(prepare_stack_trace_callback, v8::Function)                                \
-  V(process_object, v8::Object)                                                \
-  V(primordials, v8::Object)                                                   \
-  V(primordials_safe_map_prototype_object, v8::Object)                         \
-  V(primordials_safe_set_prototype_object, v8::Object)                         \
-  V(primordials_safe_weak_map_prototype_object, v8::Object)                    \
-  V(primordials_safe_weak_set_prototype_object, v8::Object)                    \
-  V(promise_hook_handler, v8::Function)                                        \
-  V(promise_reject_callback, v8::Function)                                     \
-  V(script_data_constructor_function, v8::Function)                            \
-  V(snapshot_serialize_callback, v8::Function)                                 \
-  V(snapshot_deserialize_callback, v8::Function)                               \
-  V(snapshot_deserialize_main, v8::Function)                                   \
-  V(source_map_cache_getter, v8::Function)                                     \
-  V(tick_callback_function, v8::Function)                                      \
-  V(timers_callback_function, v8::Function)                                    \
-  V(tls_wrap_constructor_function, v8::Function)                               \
-  V(trace_category_state_function, v8::Function)                               \
-  V(udp_constructor_function, v8::Function)                                    \
-  V(url_constructor_function, v8::Function)                                    \
-  V(wasm_streaming_compilation_impl, v8::Function)                             \
-  V(wasm_streaming_object_constructor, v8::Function)
-
 class Environment;
-
-typedef size_t SnapshotIndex;
-
-struct PropInfo {
-  std::string name;     // name for debugging
-  size_t id;            // In the list - in case there are any empty entries
-  SnapshotIndex index;  // In the snapshot
-};
+class Realm;
 
 struct IsolateDataSerializeInfo {
   std::vector<SnapshotIndex> primitive_values;
@@ -592,48 +130,110 @@ struct IsolateDataSerializeInfo {
                                   const IsolateDataSerializeInfo& i);
 };
 
+struct PerIsolateWrapperData {
+  uint16_t cppgc_id;
+  uint16_t non_cppgc_id;
+};
+
 class NODE_EXTERN_PRIVATE IsolateData : public MemoryRetainer {
- public:
+ private:
   IsolateData(v8::Isolate* isolate,
               uv_loop_t* event_loop,
-              MultiIsolatePlatform* platform = nullptr,
-              ArrayBufferAllocator* node_allocator = nullptr,
-              const IsolateDataSerializeInfo* isolate_data_info = nullptr);
+              MultiIsolatePlatform* platform,
+              ArrayBufferAllocator* node_allocator,
+              const SnapshotData* snapshot_data,
+              std::shared_ptr<PerIsolateOptions> options);
+
+ public:
+  static IsolateData* CreateIsolateData(
+      v8::Isolate* isolate,
+      uv_loop_t* event_loop,
+      MultiIsolatePlatform* platform = nullptr,
+      ArrayBufferAllocator* node_allocator = nullptr,
+      const SnapshotData* snapshot_data = nullptr,
+      std::shared_ptr<PerIsolateOptions> options = nullptr);
+  ~IsolateData();
+
   SET_MEMORY_INFO_NAME(IsolateData)
   SET_SELF_SIZE(IsolateData)
   void MemoryInfo(MemoryTracker* tracker) const override;
   IsolateDataSerializeInfo Serialize(v8::SnapshotCreator* creator);
 
+  bool is_building_snapshot() const { return snapshot_config_.has_value(); }
+  const SnapshotConfig* snapshot_config() const {
+    return snapshot_config_.has_value() ? &(snapshot_config_.value()) : nullptr;
+  }
+  void set_snapshot_config(const SnapshotConfig* config) {
+    if (config != nullptr) {
+      snapshot_config_ = *config;  // Copy the config.
+    }
+  }
+
+  uint16_t* embedder_id_for_cppgc() const;
+  uint16_t* embedder_id_for_non_cppgc() const;
+
   inline uv_loop_t* event_loop() const;
   inline MultiIsolatePlatform* platform() const;
+  inline const SnapshotData* snapshot_data() const;
+  // See node::SetBuiltinCodeCache().
+  const std::vector<builtins::CodeCacheInfo>& builtin_code_cache() const {
+    return builtin_code_cache_;
+  }
+  void set_builtin_code_cache(std::vector<builtins::CodeCacheInfo> entries) {
+    builtin_code_cache_ = std::move(entries);
+  }
   inline std::shared_ptr<PerIsolateOptions> options();
-  inline void set_options(std::shared_ptr<PerIsolateOptions> options);
 
   inline NodeArrayBufferAllocator* node_allocator() const;
 
   inline worker::Worker* worker_context() const;
   inline void set_worker_context(worker::Worker* context);
 
+  void AddEnvironment() { environment_count_++; }
+  void RemoveEnvironment() { environment_count_--; }
+
 #define VP(PropertyName, StringValue) V(v8::Private, PropertyName)
 #define VY(PropertyName, StringValue) V(v8::Symbol, PropertyName)
 #define VS(PropertyName, StringValue) V(v8::String, PropertyName)
+#define VR(PropertyName, TypeName) V(v8::Private, per_realm_##PropertyName)
 #define V(TypeName, PropertyName)                                             \
   inline v8::Local<TypeName> PropertyName() const;
   PER_ISOLATE_PRIVATE_SYMBOL_PROPERTIES(VP)
   PER_ISOLATE_SYMBOL_PROPERTIES(VY)
   PER_ISOLATE_STRING_PROPERTIES(VS)
+  PER_REALM_STRONG_PERSISTENT_VALUES(VR)
 #undef V
+#undef VR
 #undef VY
 #undef VS
 #undef VP
 
+#define V(Name, label, _, __)                                                  \
+  inline v8::Local<v8::String> Name##_permission_string() const;
+  PERMISSIONS(V)
+#undef V
+
+#define VM(PropertyName) V(PropertyName##_binding_template, v8::ObjectTemplate)
 #define V(PropertyName, TypeName)                                              \
   inline v8::Local<TypeName> PropertyName() const;                             \
   inline void set_##PropertyName(v8::Local<TypeName> value);
   PER_ISOLATE_TEMPLATE_PROPERTIES(V)
+  NODE_BINDINGS_WITH_PER_ISOLATE_INIT(VM)
 #undef V
+#undef VM
 
   inline v8::Local<v8::String> async_wrap_provider(int index) const;
+
+  // Symbols used by the FFI fast-call API to key per-function metadata on raw
+  // FFI functions. Kept out of env_properties.h so they are created lazily at
+  // runtime, not while the startup snapshot is built (allocating Symbols during
+  // serialization advances the isolate's identity-hash RNG, which can shift the
+  // snapshot hashes for Object.prototype/Function.prototype and make a function
+  // map and a plain-object map collide in V8's NormalizedMapCache).
+  inline v8::Local<v8::Symbol> ffi_fast_arguments_symbol() const;
+  inline void set_ffi_fast_arguments_symbol(v8::Local<v8::Symbol> value);
+  inline v8::Local<v8::Symbol> ffi_fast_buffer_invoke_symbol() const;
+  inline void set_ffi_fast_buffer_invoke_symbol(v8::Local<v8::Symbol> value);
 
   size_t max_young_gen_size = 1;
   std::unordered_map<const char*, v8::Eternal<v8::String>> static_str_map;
@@ -651,6 +251,8 @@ class NODE_EXTERN_PRIVATE IsolateData : public MemoryRetainer {
 #define VP(PropertyName, StringValue) V(v8::Private, PropertyName)
 #define VY(PropertyName, StringValue) V(v8::Symbol, PropertyName)
 #define VS(PropertyName, StringValue) V(v8::String, PropertyName)
+#define VR(PropertyName, TypeName) V(v8::Private, per_realm_##PropertyName)
+#define VM(PropertyName) V(v8::ObjectTemplate, PropertyName##_binding_template)
 #define VT(PropertyName, TypeName) V(TypeName, PropertyName)
 #define V(TypeName, PropertyName)                                             \
   v8::Eternal<TypeName> PropertyName ## _;
@@ -658,12 +260,24 @@ class NODE_EXTERN_PRIVATE IsolateData : public MemoryRetainer {
   PER_ISOLATE_SYMBOL_PROPERTIES(VY)
   PER_ISOLATE_STRING_PROPERTIES(VS)
   PER_ISOLATE_TEMPLATE_PROPERTIES(VT)
+  PER_REALM_STRONG_PERSISTENT_VALUES(VR)
+  NODE_BINDINGS_WITH_PER_ISOLATE_INIT(VM)
 #undef V
-#undef V
+#undef VM
+#undef VR
 #undef VT
 #undef VS
 #undef VY
 #undef VP
+
+#define V(Name, label, _, __)                                                  \
+  v8::Eternal<v8::String> Name##_permission_string##_;
+  PERMISSIONS(V)
+#undef V
+
+  v8::Eternal<v8::Symbol> ffi_fast_arguments_symbol_;
+  v8::Eternal<v8::Symbol> ffi_fast_buffer_invoke_symbol_;
+
   // Keep a list of all Persistent strings used for AsyncWrap Provider types.
   std::array<v8::Eternal<v8::String>, AsyncWrap::PROVIDERS_LENGTH>
       async_wrap_providers_;
@@ -672,18 +286,88 @@ class NODE_EXTERN_PRIVATE IsolateData : public MemoryRetainer {
   uv_loop_t* const event_loop_;
   NodeArrayBufferAllocator* const node_allocator_;
   MultiIsolatePlatform* platform_;
+
+  const SnapshotData* snapshot_data_;
+  std::vector<builtins::CodeCacheInfo> builtin_code_cache_;
+  std::optional<SnapshotConfig> snapshot_config_;
+
   std::shared_ptr<PerIsolateOptions> options_;
   worker::Worker* worker_context_ = nullptr;
+  size_t environment_count_ = 0;
+  PerIsolateWrapperData* wrapper_data_;
+
+  static Mutex isolate_data_mutex_;
+  static std::unordered_map<uint16_t, std::unique_ptr<PerIsolateWrapperData>>
+      wrapper_data_map_;
 };
 
 struct ContextInfo {
   explicit ContextInfo(const std::string& name) : name(name) {}
+  ContextInfo(const std::string& name, const std::string& origin)
+      : name(name), origin(origin) {}
   const std::string name;
   std::string origin;
   bool is_default = false;
 };
 
 class EnabledDebugList;
+
+// A bump allocator for stream read buffers. Reads reserve a chunk of the
+// current slab and, once completed, are handed to JS as a view (ArrayBuffer +
+// offset) over the slab, so that no per-read allocation or copy is needed.
+// Unused reservation space is rewound when a read returns fewer bytes than
+// were reserved. Slabs with reads still pending when a new slab is started
+// (possible when multiple reads are in flight, e.g. on Windows) are kept
+// alive in `retired_` until those reads complete.
+class StreamReadSlab {
+ public:
+  // Sized to match the read buffer size that libuv suggests for stream
+  // reads: a slab typically serves a single large read (still avoiding the
+  // copy that right-sizing the buffer would need), or many small ones.
+  // Larger slabs amortize allocations further, but stay alive (pinned by
+  // chunk views) long enough to be promoted to V8's old generation, where
+  // their external memory is only reclaimed by major GCs.
+  static constexpr size_t kSlabSize = 64 * 1024;
+
+  // Reserve `suggested` bytes. Starts a new slab if the current one does
+  // not have enough space left.
+  uv_buf_t Allocate(v8::Isolate* isolate, size_t suggested);
+  // Commit a completed read of `nread` bytes into the buffer previously
+  // returned by Allocate(), rewinding the unused remainder of the
+  // reservation if possible. Returns the slab's ArrayBuffer and the offset
+  // of `buf.base` within it. Returns false if the buffer was not allocated
+  // from this slab (e.g. reads rerouted from another stream listener).
+  bool Commit(v8::Isolate* isolate,
+              const uv_buf_t& buf,
+              size_t nread,
+              v8::Local<v8::ArrayBuffer>* ab,
+              size_t* offset);
+  // Return an unused reservation (failed or empty read). Returns false if
+  // the buffer was not allocated from this slab.
+  bool Release(const uv_buf_t& buf);
+
+ private:
+  struct Slab {
+    std::shared_ptr<v8::BackingStore> bs;
+    v8::Global<v8::ArrayBuffer> ab;
+    size_t offset = 0;          // Bump pointer.
+    size_t pending = 0;         // Reservations not yet committed/released.
+    char* last_base = nullptr;  // Most recent reservation...
+    size_t last_end = 0;        // ...and the bump pointer after it.
+
+    char* data() const { return static_cast<char*>(bs->Data()); }
+    size_t size() const { return bs->ByteLength(); }
+    bool Contains(const char* p) const {
+      return bs && p >= data() && p < data() + size();
+    }
+  };
+
+  Slab* FindSlab(const char* base);
+  void CompleteReservation(Slab* slab, const uv_buf_t& buf, size_t used);
+
+  Slab current_;
+  std::vector<Slab> retired_;
+};
 
 namespace per_process {
 extern std::shared_ptr<KVStore> system_environment;
@@ -730,11 +414,14 @@ class AsyncHooks : public MemoryRetainer {
   // The `js_execution_async_resources` array contains the value in that case.
   inline v8::Local<v8::Object> native_execution_async_resource(size_t index);
 
-  void SetJSPromiseHooks(v8::Local<v8::Function> init,
+  void InstallPromiseHooks(v8::Local<v8::Context> ctx);
+  void ResetPromiseHooks(v8::Local<v8::Function> init,
                          v8::Local<v8::Function> before,
                          v8::Local<v8::Function> after,
                          v8::Local<v8::Function> resolve);
-
+  // Used for testing since V8 doesn't provide API for retrieving configured
+  // JS promise hooks.
+  v8::Local<v8::Array> GetPromiseHooks(v8::Isolate* isolate) const;
   inline v8::Local<v8::String> provider_string(int idx);
 
   inline void no_force_checks();
@@ -743,14 +430,13 @@ class AsyncHooks : public MemoryRetainer {
   // NB: This call does not take (co-)ownership of `execution_async_resource`.
   // The lifetime of the `v8::Local<>` pointee must last until
   // `pop_async_context()` or `clear_async_id_stack()` are called.
-  void push_async_context(double async_id,
-                          double trigger_async_id,
-                          v8::Local<v8::Object> execution_async_resource);
+  void push_async_context(
+      double async_id,
+      double trigger_async_id,
+      const std::variant<v8::Local<v8::Object>*, v8::Global<v8::Object>*>&
+          execution_async_resource);
   bool pop_async_context(double async_id);
   void clear_async_id_stack();  // Used in fatal exceptions.
-
-  void AddContext(v8::Local<v8::Context> ctx);
-  void RemoveContext(v8::Local<v8::Context> ctx);
 
   AsyncHooks(const AsyncHooks&) = delete;
   AsyncHooks& operator=(const AsyncHooks&) = delete;
@@ -809,12 +495,18 @@ class AsyncHooks : public MemoryRetainer {
   void grow_async_ids_stack();
 
   v8::Global<v8::Array> js_execution_async_resources_;
-  std::vector<v8::Local<v8::Object>> native_execution_async_resources_;
+
+  // We avoid storing the handles directly here, because they are already
+  // properly allocated on the stack, we just need access to them here.
+  // The `v8::Global<>` variant is here because the Node-API API design
+  // does not allow us to make sure that we exclusively store this value
+  // on the stack, so we accept the small perf hit that comes with
+  // global handles in that case.
+  std::deque<std::variant<v8::Local<v8::Object>*, v8::Global<v8::Object>*>>
+      native_execution_async_resources_;
 
   // Non-empty during deserialization
   const SerializeInfo* info_ = nullptr;
-
-  std::vector<v8::Global<v8::Context>> contexts_;
 
   std::array<v8::Global<v8::Function>, 4> js_promise_hooks_;
 };
@@ -921,102 +613,111 @@ class ShouldNotAbortOnUncaughtScope {
   Environment* env_;
 };
 
-class CleanupHookCallback {
- public:
-  typedef void (*Callback)(void*);
-
-  CleanupHookCallback(Callback fn,
-                      void* arg,
-                      uint64_t insertion_order_counter)
-      : fn_(fn), arg_(arg), insertion_order_counter_(insertion_order_counter) {}
-
-  // Only hashes `arg_`, since that is usually enough to identify the hook.
-  struct Hash {
-    inline size_t operator()(const CleanupHookCallback& cb) const;
-  };
-
-  // Compares by `fn_` and `arg_` being equal.
-  struct Equal {
-    inline bool operator()(const CleanupHookCallback& a,
-                           const CleanupHookCallback& b) const;
-  };
-
-  inline BaseObject* GetBaseObject() const;
-
- private:
-  friend class Environment;
-  Callback fn_;
-  void* arg_;
-
-  // We keep track of the insertion order for these objects, so that we can
-  // call the callbacks in reverse order when we are cleaning up.
-  uint64_t insertion_order_counter_;
-};
-
 typedef void (*DeserializeRequestCallback)(v8::Local<v8::Context> context,
                                            v8::Local<v8::Object> holder,
                                            int index,
-                                           InternalFieldInfo* info);
+                                           InternalFieldInfoBase* info);
 struct DeserializeRequest {
   DeserializeRequestCallback cb;
   v8::Global<v8::Object> holder;
   int index;
-  InternalFieldInfo* info = nullptr;  // Owned by the request
-
-  // Move constructor
-  DeserializeRequest(DeserializeRequest&& other) = default;
+  InternalFieldInfoBase* info = nullptr;  // Owned by the request
 };
 
 struct EnvSerializeInfo {
-  std::vector<PropInfo> bindings;
-  std::vector<std::string> native_modules;
   AsyncHooks::SerializeInfo async_hooks;
   TickInfo::SerializeInfo tick_info;
   ImmediateInfo::SerializeInfo immediate_info;
+  AliasedBufferIndex timeout_info;
   performance::PerformanceState::SerializeInfo performance_state;
-  AliasedBufferIndex exiting;
+  AliasedBufferIndex exit_info;
   AliasedBufferIndex stream_base_state;
   AliasedBufferIndex should_abort_on_uncaught_toggle;
 
-  std::vector<PropInfo> persistent_values;
-
-  SnapshotIndex context;
+  RealmSerializeInfo principal_realm;
   friend std::ostream& operator<<(std::ostream& o, const EnvSerializeInfo& i);
+};
+
+struct SnapshotMetadata {
+  // For now kFullyCustomized is only built with the --build-snapshot CLI flag.
+  // We might want to add more types of snapshots in the future.
+  enum class Type : uint8_t { kDefault, kFullyCustomized };
+
+  Type type;
+  std::string node_version;
+  std::string node_arch;
+  std::string node_platform;
+  SnapshotFlags flags;
 };
 
 struct SnapshotData {
   enum class DataOwnership { kOwned, kNotOwned };
 
-  static const size_t kNodeBaseContextIndex = 0;
-  static const size_t kNodeMainContextIndex = kNodeBaseContextIndex + 1;
+  static const uint32_t kMagic = 0x143da19;
+  static const SnapshotIndex kNodeVMContextIndex = 0;
+  static const SnapshotIndex kNodeBaseContextIndex = kNodeVMContextIndex + 1;
+  static const SnapshotIndex kNodeMainContextIndex = kNodeBaseContextIndex + 1;
 
   DataOwnership data_ownership = DataOwnership::kOwned;
+
+  SnapshotMetadata metadata;
 
   // The result of v8::SnapshotCreator::CreateBlob() during the snapshot
   // building process.
   v8::StartupData v8_snapshot_blob_data{nullptr, 0};
+  DataOwnership v8_snapshot_blob_data_ownership = DataOwnership::kOwned;
 
   IsolateDataSerializeInfo isolate_data_info;
   // TODO(joyeecheung): there should be a vector of env_info once we snapshot
   // the worker environments.
   EnvSerializeInfo env_info;
+
   // A vector of built-in ids and v8::ScriptCompiler::CachedData, this can be
   // shared across Node.js instances because they are supposed to share the
-  // read only space. We use native_module::CodeCacheInfo because
+  // read only space. We use builtins::CodeCacheInfo because
   // v8::ScriptCompiler::CachedData is not copyable.
-  std::vector<native_module::CodeCacheInfo> code_cache;
+  std::vector<builtins::CodeCacheInfo> code_cache;
+
+  void ToFile(FILE* out) const;
+  std::vector<char> ToBlob() const;
+  // If returns false, the metadata doesn't match the current Node.js binary,
+  // and the caller should not consume the snapshot data.
+  bool Check() const;
+  static bool FromFile(SnapshotData* out, FILE* in);
+  static bool FromBlob(SnapshotData* out, const std::vector<char>& in);
+  // If the V8 data is not owned, `in` must outlive `out`.
+  static bool FromBlob(
+      SnapshotData* out,
+      std::string_view in,
+      DataOwnership v8_snapshot_blob_data_ownership = DataOwnership::kOwned);
+  static const SnapshotData* FromEmbedderWrapper(
+      const EmbedderSnapshotData* data);
 
   ~SnapshotData();
-
-  SnapshotData(const SnapshotData&) = delete;
-  SnapshotData& operator=(const SnapshotData&) = delete;
-  SnapshotData(SnapshotData&&) = delete;
-  SnapshotData& operator=(SnapshotData&&) = delete;
-
-  SnapshotData() = default;
 };
 
-class Environment : public MemoryRetainer {
+void DefaultProcessExitHandlerInternal(Environment* env, ExitCode exit_code);
+v8::Maybe<ExitCode> SpinEventLoopInternal(Environment* env);
+v8::Maybe<ExitCode> EmitProcessExitInternal(Environment* env);
+
+class Cleanable {
+ public:
+  virtual ~Cleanable() = default;
+
+ protected:
+  ListNode<Cleanable> cleanable_queue_;
+
+ private:
+  virtual void Clean() = 0;
+  friend class Environment;
+};
+
+/**
+ * Environment is a per-isolate data structure that represents an execution
+ * environment. Each environment has a principal realm. An environment can
+ * create multiple subsidiary synthetic realms.
+ */
+class Environment final : public MemoryRetainer {
  public:
   Environment(const Environment&) = delete;
   Environment& operator=(const Environment&) = delete;
@@ -1025,37 +726,32 @@ class Environment : public MemoryRetainer {
 
   SET_MEMORY_INFO_NAME(Environment)
 
+  static std::string GetExecPath(const std::vector<std::string>& argv);
+  static std::string GetCwd(const std::string& exec_path);
+
   inline size_t SelfSize() const override;
   bool IsRootNode() const override { return true; }
   void MemoryInfo(MemoryTracker* tracker) const override;
 
   EnvSerializeInfo Serialize(v8::SnapshotCreator* creator);
-  void CreateProperties();
   void DeserializeProperties(const EnvSerializeInfo* info);
 
   void PrintInfoForSnapshotIfDebug();
-  void PrintAllBaseObjects();
-  void VerifyNoStrongBaseObjects();
   void EnqueueDeserializeRequest(DeserializeRequestCallback cb,
                                  v8::Local<v8::Object> holder,
                                  int index,
-                                 InternalFieldInfo* info);
+                                 InternalFieldInfoBase* info);
   void RunDeserializeRequests();
   // Should be called before InitializeInspector()
   void InitializeDiagnostics();
 
-  std::string GetCwd();
-
 #if HAVE_INSPECTOR
   // If the environment is created for a worker, pass parent_handle and
   // the ownership if transferred into the Environment.
-  int InitializeInspector(
+  void InitializeInspector(
       std::unique_ptr<inspector::ParentInspectorHandle> parent_handle);
+  void WaitForInspectorFrontendByOptions();
 #endif
-
-  v8::MaybeLocal<v8::Value> BootstrapInternalLoaders();
-  v8::MaybeLocal<v8::Value> BootstrapNode();
-  v8::MaybeLocal<v8::Value> RunBootstrapping();
 
   inline size_t async_callback_scope_depth() const;
   inline void PushAsyncCallbackScope();
@@ -1070,25 +766,6 @@ class Environment : public MemoryRetainer {
   static inline Environment* GetCurrent(
       const v8::PropertyCallbackInfo<T>& info);
 
-  // Methods created using SetMethod(), SetPrototypeMethod(), etc. inside
-  // this scope can access the created T* object using
-  // GetBindingData<T>(args) later.
-  template <typename T>
-  T* AddBindingData(v8::Local<v8::Context> context,
-                    v8::Local<v8::Object> target);
-  template <typename T, typename U>
-  static inline T* GetBindingData(const v8::PropertyCallbackInfo<U>& info);
-  template <typename T>
-  static inline T* GetBindingData(
-      const v8::FunctionCallbackInfo<v8::Value>& info);
-  template <typename T>
-  static inline T* GetBindingData(v8::Local<v8::Context> context);
-
-  typedef std::unordered_map<
-      FastStringKey,
-      BaseObjectPtr<BaseObject>,
-      FastStringKey::Hash> BindingDataStore;
-
   // Create an Environment without initializing a main Context. Use
   // InitializeMainContext() to initialize a main context for it.
   Environment(IsolateData* isolate_data,
@@ -1097,17 +774,10 @@ class Environment : public MemoryRetainer {
               const std::vector<std::string>& exec_args,
               const EnvSerializeInfo* env_info,
               EnvironmentFlags::Flags flags,
-              ThreadId thread_id);
+              ThreadId thread_id,
+              std::string_view thread_name = "");
   void InitializeMainContext(v8::Local<v8::Context> context,
                              const EnvSerializeInfo* env_info);
-  // Create an Environment and initialize the provided main context for it.
-  Environment(IsolateData* isolate_data,
-              v8::Local<v8::Context> context,
-              const std::vector<std::string>& args,
-              const std::vector<std::string>& exec_args,
-              const EnvSerializeInfo* env_info,
-              EnvironmentFlags::Flags flags,
-              ThreadId thread_id);
   ~Environment() override;
 
   void InitializeLibuv();
@@ -1115,33 +785,30 @@ class Environment : public MemoryRetainer {
   inline const std::vector<std::string>& argv();
   const std::string& exec_path() const;
 
-  typedef void (*HandleCleanupCb)(Environment* env,
-                                  uv_handle_t* handle,
-                                  void* arg);
-  struct HandleCleanup {
-    uv_handle_t* handle_;
-    HandleCleanupCb cb_;
-    void* arg_;
-  };
-
-  void RegisterHandleCleanups();
   void CleanupHandles();
-  void Exit(int code);
-  void ExitEnv();
-
-  // Register clean-up cb to be called on environment destruction.
-  inline void RegisterHandleCleanup(uv_handle_t* handle,
-                                    HandleCleanupCb cb,
-                                    void* arg);
+  void Exit(ExitCode code);
+  void ExitEnv(StopFlags::Flags flags);
+  void ClosePerEnvHandles();
 
   template <typename T, typename OnCloseCallback>
   inline void CloseHandle(T* handle, OnCloseCallback callback);
 
-  void AssignToContext(v8::Local<v8::Context> context, const ContextInfo& info);
+  void ResetPromiseHooks(v8::Local<v8::Function> init,
+                         v8::Local<v8::Function> before,
+                         v8::Local<v8::Function> after,
+                         v8::Local<v8::Function> resolve);
+  void AssignToContext(v8::Local<v8::Context> context,
+                       Realm* realm,
+                       const ContextInfo& info);
+  void UnassignFromContext(v8::Local<v8::Context> context);
+  void TrackShadowRealm(shadow_realm::ShadowRealm* realm);
+  void UntrackShadowRealm(shadow_realm::ShadowRealm* realm);
 
   void StartProfilerIdleNotifier();
 
   inline v8::Isolate* isolate() const;
+  inline cppgc::AllocationHandle& cppgc_allocation_handle() const;
+  inline v8::ExternalMemoryAccounter* external_memory_accounter() const;
   inline uv_loop_t* event_loop() const;
   void TryLoadAddon(const char* filename,
                     int flags,
@@ -1153,16 +820,26 @@ class Environment : public MemoryRetainer {
   static inline Environment* from_immediate_check_handle(uv_check_t* handle);
   inline uv_check_t* immediate_check_handle();
   inline uv_idle_t* immediate_idle_handle();
+  // Referenced while add_refs() holds references, e.g. for running Workers.
+  uv_async_t* task_queues_async() {
+    return &task_queues_async_;
+  }
 
   inline void IncreaseWaitingRequestCounter();
   inline void DecreaseWaitingRequestCounter();
 
   inline AsyncHooks* async_hooks();
   inline ImmediateInfo* immediate_info();
+  inline AliasedInt32Array& timeout_info();
   inline TickInfo* tick_info();
   inline uint64_t timer_base() const;
+  inline permission::Permission* permission();
   inline std::shared_ptr<KVStore> env_vars();
   inline void set_env_vars(std::shared_ptr<KVStore> env_vars);
+
+  // The IPC channel descriptor passed by the parent process through
+  // NODE_CHANNEL_FD when this Environment was created, or -1.
+  inline int ipc_channel_fd() const;
 
   inline IsolateData* isolate_data() const;
 
@@ -1175,10 +852,15 @@ class Environment : public MemoryRetainer {
   inline void set_force_context_aware(bool value);
   inline bool force_context_aware() const;
 
-  // This is a pseudo-boolean that keeps track of whether the process is
-  // exiting.
+  // This contains fields that are a pseudo-boolean that keeps track of whether
+  // the process is exiting, an integer representing the process exit code, and
+  // a pseudo-boolean to indicate whether the exit code is undefined.
+  inline AliasedInt32Array& exit_info();
   inline void set_exiting(bool value);
-  inline AliasedUint32Array& exiting();
+  bool exiting() const;
+  inline ExitCode exit_code(const ExitCode default_code) const;
+
+  inline void set_exit_code(const ExitCode code);
 
   // This stores whether the --abort-on-uncaught-exception flag was passed
   // to Node.
@@ -1200,39 +882,32 @@ class Environment : public MemoryRetainer {
   // List of id's that have been destroyed and need the destroy() cb called.
   inline std::vector<double>* destroy_async_id_list();
 
-  std::set<struct node_module*> internal_bindings;
-  std::set<std::string> native_modules_with_cache;
-  std::set<std::string> native_modules_without_cache;
-  // This is only filled during deserialization. We use a vector since
-  // it's only used for tests.
-  std::vector<std::string> native_modules_in_snapshot;
+  builtins::BuiltinLoader* builtin_loader();
 
   std::unordered_multimap<int, loader::ModuleWrap*> hash_to_module_map;
-  std::unordered_map<uint32_t, loader::ModuleWrap*> id_to_module_map;
-  std::unordered_map<uint32_t, contextify::ContextifyScript*>
-      id_to_script_map;
-  std::unordered_map<uint32_t, contextify::CompiledFnEntry*> id_to_function_map;
-
-  inline uint32_t get_next_module_id();
-  inline uint32_t get_next_script_id();
-  inline uint32_t get_next_function_id();
 
   EnabledDebugList* enabled_debug_list() { return &enabled_debug_list_; }
 
   inline performance::PerformanceState* performance_state();
 
-  void CollectUVExceptionInfo(v8::Local<v8::Value> context,
-                              int errorno,
-                              const char* syscall = nullptr,
-                              const char* message = nullptr,
-                              const char* path = nullptr,
-                              const char* dest = nullptr);
+  v8::Maybe<void> CollectUVExceptionInfo(v8::Local<v8::Value> context,
+                                         int errorno,
+                                         const char* syscall = nullptr,
+                                         const char* message = nullptr,
+                                         const char* path = nullptr,
+                                         const char* dest = nullptr);
 
   // If this flag is set, calls into JS (if they would be observable
   // from userland) must be avoided.  This flag does not indicate whether
   // calling into JS is allowed from a VM perspective at this point.
   inline bool can_call_into_js() const;
   inline void set_can_call_into_js(bool can_call_into_js);
+
+  // True while RequestInterrupt() callbacks are being invoked from the
+  // v8::Isolate::RequestInterrupt() handler, i.e. potentially at an
+  // arbitrary point during JS execution. Calling into JS must be avoided
+  // in that case.
+  inline bool is_processing_v8_interrupt() const;
 
   // Increase or decrease a counter that manages whether this Environment
   // keeps the event loop alive on its own or not. The counter starts out at 0,
@@ -1242,8 +917,8 @@ class Environment : public MemoryRetainer {
   // as Workers aren't directly associated with their own libuv handles.
   void add_refs(int64_t diff);
 
+  // Convenient getter of the principal realm's has_run_bootstrapping_code().
   inline bool has_run_bootstrapping_code() const;
-  inline void DoneBootstrapping();
 
   inline bool has_serialized_options() const;
   inline void set_has_serialized_options(bool has_serialized_options);
@@ -1252,13 +927,17 @@ class Environment : public MemoryRetainer {
   inline bool no_native_addons() const;
   inline bool should_not_register_esm_loader() const;
   inline bool should_create_inspector() const;
+  inline bool should_wait_for_inspector_frontend() const;
   inline bool owns_process_state() const;
   inline bool owns_inspector() const;
   inline bool tracks_unmanaged_fds() const;
   inline bool hide_console_windows() const;
   inline bool no_global_search_paths() const;
+  inline bool should_start_debug_signal_handler() const;
   inline bool no_browser_globals() const;
+  inline bool no_addon_permission_for_linked_bindings() const;
   inline uint64_t thread_id() const;
+  inline std::string_view thread_name() const;
   inline worker::Worker* worker_context() const;
   Environment* worker_parent_env() const;
   inline void add_sub_worker_context(worker::Worker* context);
@@ -1266,6 +945,7 @@ class Environment : public MemoryRetainer {
   void stop_sub_worker_contexts();
   template <typename Fn>
   inline void ForEachWorker(Fn&& iterator);
+  // Determine if the environment is stopping. This getter is thread-safe.
   inline bool is_stopping() const;
   inline void set_stopping(bool value);
   inline std::list<node_module>* extra_linked_bindings();
@@ -1273,15 +953,15 @@ class Environment : public MemoryRetainer {
   inline node_module* extra_linked_bindings_tail();
   inline const Mutex& extra_linked_bindings_mutex() const;
 
-  inline bool filehandle_close_warning() const;
-  inline void set_filehandle_close_warning(bool on);
-
   inline void set_source_maps_enabled(bool on);
   inline bool source_maps_enabled() const;
 
   inline void ThrowError(const char* errmsg);
   inline void ThrowTypeError(const char* errmsg);
   inline void ThrowRangeError(const char* errmsg);
+  inline void ThrowStdErrException(std::error_code error_code,
+                                   const char* syscall,
+                                   const char* path = nullptr);
   inline void ThrowErrnoException(int errorno,
                                   const char* syscall = nullptr,
                                   const char* message = nullptr,
@@ -1292,66 +972,17 @@ class Environment : public MemoryRetainer {
                                const char* path = nullptr,
                                const char* dest = nullptr);
 
-  v8::Local<v8::FunctionTemplate> NewFunctionTemplate(
-      v8::FunctionCallback callback,
-      v8::Local<v8::Signature> signature = v8::Local<v8::Signature>(),
-      v8::ConstructorBehavior behavior = v8::ConstructorBehavior::kAllow,
-      v8::SideEffectType side_effect = v8::SideEffectType::kHasSideEffect,
-      const v8::CFunction* c_function = nullptr);
-
-  // Convenience methods for NewFunctionTemplate().
-  void SetMethod(v8::Local<v8::Object> that,
-                 const char* name,
-                 v8::FunctionCallback callback);
-
-  void SetFastMethod(v8::Local<v8::Object> that,
-                     const char* name,
-                     v8::FunctionCallback slow_callback,
-                     const v8::CFunction* c_function);
-
-  void SetProtoMethod(v8::Local<v8::FunctionTemplate> that,
-                      const char* name,
-                      v8::FunctionCallback callback);
-
-  void SetInstanceMethod(v8::Local<v8::FunctionTemplate> that,
-                         const char* name,
-                         v8::FunctionCallback callback);
-
-  // Safe variants denote the function has no side effects.
-  void SetMethodNoSideEffect(v8::Local<v8::Object> that,
-                             const char* name,
-                             v8::FunctionCallback callback);
-  void SetProtoMethodNoSideEffect(v8::Local<v8::FunctionTemplate> that,
-                                  const char* name,
-                                  v8::FunctionCallback callback);
-
-  enum class SetConstructorFunctionFlag {
-    NONE,
-    SET_CLASS_NAME,
-  };
-
-  void SetConstructorFunction(v8::Local<v8::Object> that,
-                              const char* name,
-                              v8::Local<v8::FunctionTemplate> tmpl,
-                              SetConstructorFunctionFlag flag =
-                                  SetConstructorFunctionFlag::SET_CLASS_NAME);
-
-  void SetConstructorFunction(v8::Local<v8::Object> that,
-                              v8::Local<v8::String> name,
-                              v8::Local<v8::FunctionTemplate> tmpl,
-                              SetConstructorFunctionFlag flag =
-                                  SetConstructorFunctionFlag::SET_CLASS_NAME);
-
   void AtExit(void (*cb)(void* arg), void* arg);
   void RunAtExitCallbacks();
 
+  v8::Maybe<bool> CheckUnsettledTopLevelAwait() const;
   void RunWeakRefCleanup();
 
   v8::MaybeLocal<v8::Value> RunSnapshotSerializeCallback() const;
   v8::MaybeLocal<v8::Value> RunSnapshotDeserializeCallback() const;
   v8::MaybeLocal<v8::Value> RunSnapshotDeserializeMain() const;
 
-  // Strings and private symbols are shared across shared contexts
+  // Primitive values are shared across realms.
   // The getters simply proxy to the per-isolate primitive.
 #define VP(PropertyName, StringValue) V(v8::Private, PropertyName)
 #define VY(PropertyName, StringValue) V(v8::Symbol, PropertyName)
@@ -1366,18 +997,39 @@ class Environment : public MemoryRetainer {
 #undef VY
 #undef VP
 
+  // Runtime-created FFI fast-call API Symbols (see IsolateData).
+  inline v8::Local<v8::Symbol> ffi_fast_arguments_symbol() const;
+  inline void set_ffi_fast_arguments_symbol(v8::Local<v8::Symbol> value);
+  inline v8::Local<v8::Symbol> ffi_fast_buffer_invoke_symbol() const;
+  inline void set_ffi_fast_buffer_invoke_symbol(v8::Local<v8::Symbol> value);
+
+#define V(Name, label, _, __)                                                  \
+  inline v8::Local<v8::String> Name##_permission_string() const;
+  PERMISSIONS(V)
+#undef V
+
 #define V(PropertyName, TypeName)                                             \
   inline v8::Local<TypeName> PropertyName() const;                            \
   inline void set_ ## PropertyName(v8::Local<TypeName> value);
   PER_ISOLATE_TEMPLATE_PROPERTIES(V)
-  ENVIRONMENT_STRONG_PERSISTENT_VALUES(V)
+  // Per-realm strong persistent values of the principal realm.
+  // Get/set the value with an explicit realm instead when possible.
+  // Deprecate soon.
+  PER_REALM_STRONG_PERSISTENT_VALUES(V)
 #undef V
 
+  // Return the context of the principal realm.
+  // Get the context with an explicit realm instead when possible.
+  // Deprecate soon.
   inline v8::Local<v8::Context> context() const;
+  inline PrincipalRealm* principal_realm() const;
 
 #if HAVE_INSPECTOR
   inline inspector::Agent* inspector_agent() const {
     return inspector_agent_.get();
+  }
+  inline void StopInspector() {
+    inspector_agent_.reset();
   }
 
   inline bool is_in_inspector_console_call() const;
@@ -1386,13 +1038,19 @@ class Environment : public MemoryRetainer {
 
   typedef ListHead<HandleWrap, &HandleWrap::handle_wrap_queue_> HandleWrapQueue;
   typedef ListHead<ReqWrapBase, &ReqWrapBase::req_wrap_queue_> ReqWrapQueue;
+  typedef ListHead<Cleanable, &Cleanable::cleanable_queue_> CleanableQueue;
 
   inline HandleWrapQueue* handle_wrap_queue() { return &handle_wrap_queue_; }
+  inline CleanableQueue* cleanable_queue() {
+    return &cleanable_queue_;
+  }
   inline ReqWrapQueue* req_wrap_queue() { return &req_wrap_queue_; }
 
+  // https://w3c.github.io/hr-time/#dfn-time-origin
   inline uint64_t time_origin() {
     return time_origin_;
   }
+  // https://w3c.github.io/hr-time/#dfn-get-time-origin-timestamp
   inline double time_origin_timestamp() {
     return time_origin_timestamp_;
   }
@@ -1435,17 +1093,27 @@ class Environment : public MemoryRetainer {
   static inline Environment* ForAsyncHooks(AsyncHooks* hooks);
 
   v8::Local<v8::Value> GetNow();
+  uint64_t GetNowUint64();
+
   void ScheduleTimer(int64_t duration);
   void ToggleTimerRef(bool ref);
 
-  using CleanupCallback = CleanupHookCallback::Callback;
-  inline void AddCleanupHook(CleanupCallback cb, void* arg);
-  inline void RemoveCleanupHook(CleanupCallback cb, void* arg);
+  inline void AddCleanupHook(CleanupQueue::Callback cb, void* arg);
+  inline void RemoveCleanupHook(CleanupQueue::Callback cb, void* arg);
   void RunCleanup();
 
+  static void TracePromises(v8::PromiseHookType type,
+                            v8::Local<v8::Promise> promise,
+                            v8::Local<v8::Value> parent);
   static size_t NearHeapLimitCallback(void* data,
                                       size_t current_heap_limit,
                                       size_t initial_heap_limit);
+  static size_t HeapSnapshotNearHeapLimitCallback(void* data,
+                                                  size_t current_heap_limit,
+                                                  size_t initial_heap_limit);
+  static size_t HeapProfileNearHeapLimitCallback(void* data,
+                                                 size_t current_heap_limit,
+                                                 size_t initial_heap_limit);
   static void BuildEmbedderGraph(v8::Isolate* isolate,
                                  v8::EmbedderGraph* graph,
                                  void* data);
@@ -1453,14 +1121,7 @@ class Environment : public MemoryRetainer {
   inline std::shared_ptr<EnvironmentOptions> options();
   inline std::shared_ptr<ExclusiveAccess<HostPort>> inspector_host_port();
 
-  // The BaseObject count is a debugging helper that makes sure that there are
-  // no memory leaks caused by BaseObjects staying alive longer than expected
-  // (in particular, no circular BaseObjectPtr references).
-  inline void modify_base_object_count(int64_t delta);
-  inline int64_t base_object_created_after_bootstrap() const;
-  inline int64_t base_object_count() const;
-
-  inline int32_t stack_trace_limit() const { return 10; }
+  inline int64_t stack_trace_limit() const;
 
 #if HAVE_INSPECTOR
   void set_coverage_connection(
@@ -1498,29 +1159,92 @@ class Environment : public MemoryRetainer {
 
 #endif  // HAVE_INSPECTOR
 
-  inline void set_main_utf16(std::unique_ptr<v8::String::Value>);
+  inline const EmbedderPreloadCallback& embedder_preload() const;
+  inline void set_embedder_preload(EmbedderPreloadCallback fn);
+
   inline void set_process_exit_handler(
-      std::function<void(Environment*, int)>&& handler);
+      std::function<void(Environment*, ExitCode)>&& handler);
+
+  inline CompileCacheHandler* compile_cache_handler();
+  inline bool use_compile_cache() const;
+  void InitializeCompileCache();
+  // Enable built-in compile cache if it has not yet been enabled.
+  // The cache will be persisted to disk on exit.
+  CompileCacheEnableResult EnableCompileCache(const std::string& cache_dir,
+                                              EnableOption option);
+  void FlushCompileCache();
 
   void RunAndClearNativeImmediates(bool only_refed = false);
   void RunAndClearInterrupts();
+  bool HasNativeImmediates() const;
 
   uv_buf_t allocate_managed_buffer(const size_t suggested_size);
   std::unique_ptr<v8::BackingStore> release_managed_buffer(const uv_buf_t& buf);
+  // Only buffers that were not exposed externally may be recycled.
+  void recycle_managed_buffer(std::unique_ptr<v8::BackingStore> bs);
+
+  StreamReadSlab& stream_read_slab() {
+    return stream_read_slab_;
+  }
 
   void AddUnmanagedFd(int fd);
   void RemoveUnmanagedFd(int fd);
 
   template <typename T>
-  void ForEachBindingData(T&& iterator);
+  void ForEachRealm(T&& iterator) const;
+
+  inline void set_heap_snapshot_near_heap_limit(uint32_t limit);
+  inline bool is_in_heapsnapshot_heap_limit_callback() const;
+  inline void set_heap_profile_near_heap_limit(uint32_t limit);
+  inline bool is_in_heap_profile_near_heap_limit_callback() const;
+
+  inline bool report_exclude_env() const;
+
+  inline void AddHeapSnapshotNearHeapLimitCallback();
+  inline void RemoveHeapSnapshotNearHeapLimitCallback(size_t heap_limit);
+
+  inline void AddHeapProfileNearHeapLimitCallback();
+  inline void RemoveHeapProfileNearHeapLimitCallback(size_t heap_limit);
+
+  v8::CpuProfilingResult StartCpuProfile(const CpuProfileOptions& options);
+  v8::CpuProfile* StopCpuProfile(v8::ProfilerId profile_id);
+
+  // Field identifiers for exit_info_
+  enum ExitInfoField {
+    kExiting = 0,
+    kExitCode,
+    kHasExitCode,
+    kExitInfoFieldCount
+  };
+
+#if HAVE_OPENSSL
+  uint64_t hash_cache_generation = 0;
+  std::unique_ptr<ncrypto::DigestCache> provider_digest_cache;
+  std::unique_ptr<ncrypto::CipherCache> provider_cipher_cache;
+  std::vector<std::string> supported_hash_algorithms;
+  uint64_t mac_cache_generation = 0;
+  std::unique_ptr<ncrypto::MacCache> provider_mac_cache;
+  std::vector<std::string> supported_mac_algorithms;
+  bool supported_mac_algorithms_initialized = false;
+  DeleteFnPtr<crypto::RootCertStore, crypto::FreeRootCertStore> root_cert_store;
+#endif  // HAVE_OPENSSL
+
+  v8::Global<v8::Module> temporary_required_module_facade_original;
 
  private:
-  inline void ThrowError(v8::Local<v8::Value> (*fun)(v8::Local<v8::String>),
+  inline void ThrowError(v8::Local<v8::Value> (*fun)(v8::Local<v8::String>,
+                                                     v8::Local<v8::Value>),
                          const char* errmsg);
+  void TrackContext(v8::Local<v8::Context> context);
+  void UntrackContext(v8::Local<v8::Context> context);
+  void PurgeTrackedEmptyContexts();
 
   std::list<binding::DLib> loaded_addons_;
   v8::Isolate* const isolate_;
+  const std::unique_ptr<v8::ExternalMemoryAccounter> external_memory_accounter_;
   IsolateData* const isolate_data_;
+
+  bool env_handle_initialized_ = false;
   uv_timer_t timer_handle_;
   uv_check_t immediate_check_handle_;
   uv_idle_t immediate_idle_handle_;
@@ -1529,20 +1253,27 @@ class Environment : public MemoryRetainer {
   uv_async_t task_queues_async_;
   int64_t task_queues_async_refs_ = 0;
 
+  // These may be read by ctors and should be listed before complex fields.
+  std::atomic_bool is_stopping_{false};
+  std::atomic_bool can_call_into_js_{true};
+
   AsyncHooks async_hooks_;
   ImmediateInfo immediate_info_;
+  AliasedInt32Array timeout_info_;
   TickInfo tick_info_;
+  permission::Permission permission_;
   const uint64_t timer_base_;
   std::shared_ptr<KVStore> env_vars_;
+  int ipc_channel_fd_ = -1;
   bool printed_error_ = false;
   bool trace_sync_io_ = false;
   bool emit_env_nonstring_warning_ = true;
   bool emit_err_name_warning_ = true;
-  bool emit_filehandle_warning_ = true;
   bool source_maps_enabled_ = false;
 
   size_t async_callback_scope_depth_ = 0;
   std::vector<double> destroy_async_id_list_;
+  std::unordered_set<shadow_realm::ShadowRealm*> shadow_realms_;
 
 #if HAVE_INSPECTOR
   std::unique_ptr<profiler::V8CoverageConnection> coverage_connection_;
@@ -1557,6 +1288,7 @@ class Environment : public MemoryRetainer {
   uint64_t heap_prof_interval_;
 #endif  // HAVE_INSPECTOR
 
+  std::unique_ptr<CompileCacheHandler> compile_cache_handler_;
   std::shared_ptr<EnvironmentOptions> options_;
   // options_ contains debug options parsed from CLI arguments,
   // while inspector_host_port_ stores the actual inspector host
@@ -1570,14 +1302,22 @@ class Environment : public MemoryRetainer {
   std::vector<std::string> argv_;
   std::string exec_path_;
 
-  bool is_processing_heap_limit_callback_ = false;
-  int64_t heap_limit_snapshot_taken_ = 0;
+  bool is_in_heapsnapshot_heap_limit_callback_ = false;
+  uint32_t heap_limit_snapshot_taken_ = 0;
+  uint32_t heap_snapshot_near_heap_limit_ = 0;
+  bool heapsnapshot_near_heap_limit_callback_added_ = false;
+
+  bool is_in_heap_profile_near_heap_limit_callback_ = false;
+  uint32_t heap_limit_profile_taken_ = 0;
+  uint32_t heap_profile_near_heap_limit_ = 0;
+  bool heap_profile_near_heap_limit_callback_added_ = false;
 
   uint32_t module_id_counter_ = 0;
   uint32_t script_id_counter_ = 0;
   uint32_t function_id_counter_ = 0;
+  uint32_t trace_promise_id_counter_ = 0;
 
-  AliasedUint32Array exiting_;
+  AliasedInt32Array exit_info_;
 
   AliasedUint32Array should_abort_on_uncaught_toggle_;
   int should_not_abort_scope_counter_ = 0;
@@ -1586,22 +1326,25 @@ class Environment : public MemoryRetainer {
 
   AliasedInt32Array stream_base_state_;
 
-  // https://w3c.github.io/hr-time/#dfn-time-origin
-  uint64_t time_origin_;
-  // https://w3c.github.io/hr-time/#dfn-get-time-origin-timestamp
-  double time_origin_timestamp_;
+  // As PerformanceNodeTiming is exposed in worker_threads, the per_process
+  // time origin is exposed in the worker threads. This is an intentional
+  // diverge from the HTML spec of web workers.
+  // Process start time from the monotonic clock. This should not be used as an
+  // absolute time, but only as a time relative to another monotonic clock time.
+  const uint64_t time_origin_;
+  // Process start timestamp from the wall clock. This is an absolute time
+  // exposed as `performance.timeOrigin`.
+  const double time_origin_timestamp_;
+  // This is the time when the environment is created.
+  const uint64_t environment_start_;
   std::unique_ptr<performance::PerformanceState> performance_state_;
 
-  bool has_run_bootstrapping_code_ = false;
   bool has_serialized_options_ = false;
 
-  std::atomic_bool can_call_into_js_ { true };
   uint64_t flags_;
   uint64_t thread_id_;
+  std::string thread_name_;
   std::unordered_set<worker::Worker*> sub_worker_contexts_;
-
-  static void* const kNodeContextTagPtr;
-  static int const kNodeContextTag;
 
 #if HAVE_INSPECTOR
   std::unique_ptr<inspector::Agent> inspector_agent_;
@@ -1617,14 +1360,15 @@ class Environment : public MemoryRetainer {
   // memory are predictable. For more information please refer to
   // `doc/contributing/node-postmortem-support.md`
   friend int GenDebugSymbols();
+  CleanableQueue cleanable_queue_;
   HandleWrapQueue handle_wrap_queue_;
   ReqWrapQueue req_wrap_queue_;
-  std::list<HandleCleanup> handle_cleanup_queue_;
   int handle_cleanup_waiting_ = 0;
   int request_waiting_ = 0;
 
   EnabledDebugList enabled_debug_list_;
 
+  std::vector<v8::Global<v8::Context>> contexts_;
   std::list<node_module> extra_linked_bindings_;
   Mutex extra_linked_bindings_mutex_;
 
@@ -1649,45 +1393,34 @@ class Environment : public MemoryRetainer {
   bool task_queues_async_initialized_ = false;
 
   std::atomic<Environment**> interrupt_data_ {nullptr};
+  bool is_processing_v8_interrupt_ = false;
   void RequestInterruptFromV8();
   static void CheckImmediate(uv_check_t* handle);
 
-  BindingDataStore bindings_;
-
-  // Use an unordered_set, so that we have efficient insertion and removal.
-  std::unordered_set<CleanupHookCallback,
-                     CleanupHookCallback::Hash,
-                     CleanupHookCallback::Equal> cleanup_hooks_;
-  uint64_t cleanup_hook_counter_ = 0;
+  CleanupQueue cleanup_queue_;
   bool started_cleanup_ = false;
-
-  int64_t base_object_count_ = 0;
-  int64_t base_object_created_by_bootstrap_ = 0;
-  std::atomic_bool is_stopping_ { false };
 
   std::unordered_set<int> unmanaged_fds_;
 
-  std::function<void(Environment*, int)> process_exit_handler_ {
-      DefaultProcessExitHandler };
+  std::function<void(Environment*, ExitCode)> process_exit_handler_{
+      DefaultProcessExitHandlerInternal};
 
-  template <typename T>
-  void ForEachBaseObject(T&& iterator);
+  std::unique_ptr<PrincipalRealm> principal_realm_ = nullptr;
 
-#define V(PropertyName, TypeName) v8::Global<TypeName> PropertyName ## _;
-  ENVIRONMENT_STRONG_PERSISTENT_VALUES(V)
-#undef V
-
-  v8::Global<v8::Context> context_;
-
-  // Keeps the main script source alive is one was passed to LoadEnvironment().
-  // We should probably find a way to just use plain `v8::String`s created from
-  // the source passed to LoadEnvironment() directly instead.
-  std::unique_ptr<v8::String::Value> main_utf16_;
+  builtins::BuiltinLoader builtin_loader_;
+  EmbedderPreloadCallback embedder_preload_;
 
   // Used by allocate_managed_buffer() and release_managed_buffer() to keep
   // track of the BackingStore for a given pointer.
   std::unordered_map<char*, std::unique_ptr<v8::BackingStore>>
       released_allocated_buffers_;
+  std::unique_ptr<v8::BackingStore> managed_buffer_cache_;
+
+  // Used by EmitToJSStreamListener to allocate stream read buffers.
+  StreamReadSlab stream_read_slab_;
+
+  v8::CpuProfiler* cpu_profiler_ = nullptr;
+  std::vector<v8::ProfilerId> pending_profiles_;
 };
 
 }  // namespace node

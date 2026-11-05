@@ -26,6 +26,7 @@ const objects = [
   Buffer.from([1, 2, 3, 4]),
   new BigInt64Array([42n]),
   new BigUint64Array([42n]),
+  new Float16Array([1, 2, 3, 4]),
   undefined,
   null,
   42,
@@ -53,6 +54,17 @@ const hostObject = new (internalBinding('js_stream').JSStream)();
   for (const obj of objects) {
     assert.deepStrictEqual(v8.deserialize(v8.serialize(obj)), obj);
   }
+}
+
+{
+  const buffer = Buffer.from([1, 2, 3, 4]);
+  Object.defineProperty(buffer, Symbol.toStringTag, {
+    value: 'CustomBuffer',
+  });
+
+  const deserialized = v8.deserialize(v8.serialize(buffer));
+  assert(Buffer.isBuffer(deserialized));
+  assert.deepStrictEqual(deserialized, Buffer.from(buffer));
 }
 
 {
@@ -107,7 +119,6 @@ const hostObject = new (internalBinding('js_stream').JSStream)();
 {
   const text = 'hostObjectTag';
   const data = Buffer.from(text);
-  const arrayBufferViews = common.getArrayBufferViews(data);
 
   // `buf` is one of `TypedArray` or `DataView`.
   function testWriteRawBytes(buf) {
@@ -138,9 +149,9 @@ const hostObject = new (internalBinding('js_stream').JSStream)();
     assert.strictEqual(des.readValue().val, hostObject);
   }
 
-  arrayBufferViews.forEach((buf) => {
+  for (const buf of common.getArrayBufferViews(data)) {
     testWriteRawBytes(buf);
-  });
+  }
 }
 
 {
@@ -184,7 +195,7 @@ const hostObject = new (internalBinding('js_stream').JSStream)();
     Consider opening an issue as a heads up at https://github.com/nodejs/node/issues/new
   `;
 
-  const desStr = 'ff0f6f2203666f6f5e007b01';
+  const desStr = 'ff106f2203666f6f5e007b01';
 
   const desBuf = Buffer.from(desStr, 'hex');
   const des = new v8.DefaultDeserializer(desBuf);

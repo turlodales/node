@@ -13,6 +13,7 @@ using v8::Context;
 using v8::Function;
 using v8::FunctionCallbackInfo;
 using v8::FunctionTemplate;
+using v8::Isolate;
 using v8::Local;
 using v8::MaybeLocal;
 using v8::Object;
@@ -25,15 +26,15 @@ Local<Function> WasmStreamingObject::Initialize(Environment* env) {
     return templ;
   }
 
-  Local<FunctionTemplate> t = env->NewFunctionTemplate(New);
-  t->Inherit(BaseObject::GetConstructorTemplate(env));
+  Isolate* isolate = env->isolate();
+  Local<FunctionTemplate> t = NewFunctionTemplate(isolate, New);
   t->InstanceTemplate()->SetInternalFieldCount(
       WasmStreamingObject::kInternalFieldCount);
 
-  env->SetProtoMethod(t, "setURL", SetURL);
-  env->SetProtoMethod(t, "push", Push);
-  env->SetProtoMethod(t, "finish", Finish);
-  env->SetProtoMethod(t, "abort", Abort);
+  SetProtoMethod(isolate, t, "setURL", SetURL);
+  SetProtoMethod(isolate, t, "push", Push);
+  SetProtoMethod(isolate, t, "finish", Finish);
+  SetProtoMethod(isolate, t, "abort", Abort);
 
   auto function = t->GetFunction(env->context()).ToLocalChecked();
   env->set_wasm_streaming_object_constructor(function);
@@ -43,6 +44,7 @@ Local<Function> WasmStreamingObject::Initialize(Environment* env) {
 void WasmStreamingObject::RegisterExternalReferences(
     ExternalReferenceRegistry* registry) {
   registry->Register(New);
+  registry->Register(SetURL);
   registry->Register(Push);
   registry->Register(Finish);
   registry->Register(Abort);
@@ -80,18 +82,18 @@ void WasmStreamingObject::New(const FunctionCallbackInfo<Value>& args) {
 
 void WasmStreamingObject::SetURL(const FunctionCallbackInfo<Value>& args) {
   WasmStreamingObject* obj;
-  ASSIGN_OR_RETURN_UNWRAP(&obj, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&obj, args.This());
   CHECK(obj->streaming_);
 
   CHECK_EQ(args.Length(), 1);
   CHECK(args[0]->IsString());
-  Utf8Value url(Environment::GetCurrent(args)->isolate(), args[0]);
+  Utf8Value url(args.GetIsolate(), args[0]);
   obj->streaming_->SetUrl(url.out(), url.length());
 }
 
 void WasmStreamingObject::Push(const FunctionCallbackInfo<Value>& args) {
   WasmStreamingObject* obj;
-  ASSIGN_OR_RETURN_UNWRAP(&obj, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&obj, args.This());
   CHECK(obj->streaming_);
 
   CHECK_EQ(args.Length(), 1);
@@ -103,14 +105,14 @@ void WasmStreamingObject::Push(const FunctionCallbackInfo<Value>& args) {
   size_t offset;
   size_t size;
 
-  if (LIKELY(chunk->IsArrayBufferView())) {
+  if (chunk->IsArrayBufferView()) [[likely]] {
     Local<ArrayBufferView> view = chunk.As<ArrayBufferView>();
-    bytes = view->Buffer()->GetBackingStore()->Data();
+    bytes = view->Buffer()->Data();
     offset = view->ByteOffset();
     size = view->ByteLength();
-  } else if (LIKELY(chunk->IsArrayBuffer())) {
+  } else if (chunk->IsArrayBuffer()) [[likely]] {
     Local<ArrayBuffer> buffer = chunk.As<ArrayBuffer>();
-    bytes = buffer->GetBackingStore()->Data();
+    bytes = buffer->Data();
     offset = 0;
     size = buffer->ByteLength();
   } else {
@@ -127,16 +129,16 @@ void WasmStreamingObject::Push(const FunctionCallbackInfo<Value>& args) {
 
 void WasmStreamingObject::Finish(const FunctionCallbackInfo<Value>& args) {
   WasmStreamingObject* obj;
-  ASSIGN_OR_RETURN_UNWRAP(&obj, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&obj, args.This());
   CHECK(obj->streaming_);
 
   CHECK_EQ(args.Length(), 0);
-  obj->streaming_->Finish();
+  obj->streaming_->Finish(WasmStreaming::ModuleCachingCallback{});
 }
 
 void WasmStreamingObject::Abort(const FunctionCallbackInfo<Value>& args) {
   WasmStreamingObject* obj;
-  ASSIGN_OR_RETURN_UNWRAP(&obj, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&obj, args.This());
   CHECK(obj->streaming_);
 
   CHECK_EQ(args.Length(), 1);
@@ -194,8 +196,7 @@ void Initialize(Local<Object> target,
                 Local<Value>,
                 Local<Context> context,
                 void*) {
-  Environment* env = Environment::GetCurrent(context);
-  env->SetMethod(target, "setImplementation", SetImplementation);
+  SetMethod(context, target, "setImplementation", SetImplementation);
 }
 
 void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
@@ -207,6 +208,7 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
 }  // namespace wasm_web_api
 }  // namespace node
 
-NODE_MODULE_CONTEXT_AWARE_INTERNAL(wasm_web_api, node::wasm_web_api::Initialize)
-NODE_MODULE_EXTERNAL_REFERENCE(wasm_web_api,
-                               node::wasm_web_api::RegisterExternalReferences)
+NODE_BINDING_CONTEXT_AWARE_INTERNAL(wasm_web_api,
+                                    node::wasm_web_api::Initialize)
+NODE_BINDING_EXTERNAL_REFERENCE(wasm_web_api,
+                                node::wasm_web_api::RegisterExternalReferences)

@@ -3,9 +3,9 @@
 // just a simple http server and client.
 
 const common = require('../common');
-const onGC = require('../common/ongc');
+const { onGC } = require('../common/gc');
 
-const cpus = require('os').cpus().length;
+const cpus = require('os').availableParallelism();
 
 function serverHandler(req, res) {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -13,6 +13,7 @@ function serverHandler(req, res) {
 }
 
 const http = require('http');
+const numRequests = 36;
 let createClients = true;
 let done = 0;
 let count = 0;
@@ -21,23 +22,26 @@ let countGC = 0;
 const server = http.createServer(serverHandler);
 server.listen(0, common.mustCall(() => {
   for (let i = 0; i < cpus; i++)
-    getAll();
+    getAll(numRequests);
 }));
 
-function getAll() {
+function getAll(requestsRemaining) {
   if (!createClients)
+    return;
+
+  if (requestsRemaining <= 0)
     return;
 
   const req = http.get({
     hostname: 'localhost',
     pathname: '/',
-    port: server.address().port
+    port: server.address().port,
   }, cb);
 
   count++;
   onGC(req, { ongc });
 
-  setImmediate(getAll);
+  setImmediate(getAll, requestsRemaining - 1);
 }
 
 function cb(res) {

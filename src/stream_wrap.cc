@@ -46,12 +46,14 @@ using v8::EscapableHandleScope;
 using v8::FunctionCallbackInfo;
 using v8::FunctionTemplate;
 using v8::HandleScope;
+using v8::Isolate;
 using v8::JustVoid;
 using v8::Local;
 using v8::Maybe;
 using v8::MaybeLocal;
 using v8::Nothing;
 using v8::Object;
+using v8::ObjectTemplate;
 using v8::PropertyAttribute;
 using v8::ReadOnly;
 using v8::Signature;
@@ -67,45 +69,67 @@ void LibuvStreamWrap::Initialize(Local<Object> target,
                                  Local<Context> context,
                                  void* priv) {
   Environment* env = Environment::GetCurrent(context);
+  Isolate* isolate = env->isolate();
 
-  Local<FunctionTemplate> sw =
-      FunctionTemplate::New(env->isolate(), IsConstructCallCallback);
-  sw->InstanceTemplate()->SetInternalFieldCount(StreamReq::kInternalFieldCount);
+  Local<FunctionTemplate> sw = env->shutdown_wrap_template();
+  if (sw.IsEmpty()) {
+    sw = NewFunctionTemplate(isolate, IsConstructCallCallback);
+    sw->InstanceTemplate()->SetInternalFieldCount(
+        ShutdownWrap::kInternalFieldCount);
 
-  // we need to set handle and callback to null,
-  // so that those fields are created and functions
-  // do not become megamorphic
-  // Fields:
-  // - oncomplete
-  // - callback
-  // - handle
-  sw->InstanceTemplate()->Set(
-      env->oncomplete_string(),
-      v8::Null(env->isolate()));
-  sw->InstanceTemplate()->Set(FIXED_ONE_BYTE_STRING(env->isolate(), "callback"),
-      v8::Null(env->isolate()));
-  sw->InstanceTemplate()->Set(FIXED_ONE_BYTE_STRING(env->isolate(), "handle"),
-      v8::Null(env->isolate()));
+    // we need to set handle and callback to null,
+    // so that those fields are created and functions
+    // do not become megamorphic
+    // Fields:
+    // - oncomplete
+    // - callback
+    // - handle
+    sw->InstanceTemplate()->Set(env->oncomplete_string(), v8::Null(isolate));
+    sw->InstanceTemplate()->Set(FIXED_ONE_BYTE_STRING(isolate, "callback"),
+                                v8::Null(isolate));
+    sw->InstanceTemplate()->Set(env->handle_string(), v8::Null(isolate));
 
-  sw->Inherit(AsyncWrap::GetConstructorTemplate(env));
+    sw->Inherit(AsyncWrap::GetConstructorTemplate(env));
+    sw->SetClassName(FIXED_ONE_BYTE_STRING(isolate, "ShutdownWrap"));
+    env->set_shutdown_wrap_template(sw);
+  }
+  SetConstructorFunction(
+      context, target, "ShutdownWrap", sw, SetConstructorFunctionFlag::NONE);
 
-  env->SetConstructorFunction(target, "ShutdownWrap", sw);
-  env->set_shutdown_wrap_template(sw->InstanceTemplate());
-
-  Local<FunctionTemplate> ww =
-      FunctionTemplate::New(env->isolate(), IsConstructCallCallback);
-  ww->InstanceTemplate()->SetInternalFieldCount(
-      StreamReq::kInternalFieldCount);
-  ww->Inherit(AsyncWrap::GetConstructorTemplate(env));
-  env->SetConstructorFunction(target, "WriteWrap", ww);
-  env->set_write_wrap_template(ww->InstanceTemplate());
+  Local<FunctionTemplate> ww = env->write_wrap_template();
+  if (ww.IsEmpty()) {
+    ww = FunctionTemplate::New(isolate, IsConstructCallCallback);
+    Local<ObjectTemplate> wwt = ww->InstanceTemplate();
+    wwt->SetInternalFieldCount(WriteWrap::kInternalFieldCount);
+    // Pre-create the fields that JS attaches to write requests, so that they
+    // are in-object properties and the object shape stays monomorphic.
+    wwt->Set(env->oncomplete_string(), v8::Null(isolate));
+    wwt->Set(FIXED_ONE_BYTE_STRING(isolate, "callback"), v8::Null(isolate));
+    wwt->Set(env->handle_string(), v8::Null(isolate));
+    wwt->Set(FIXED_ONE_BYTE_STRING(isolate, "async"), v8::False(isolate));
+    wwt->Set(FIXED_ONE_BYTE_STRING(isolate, "bytes"),
+             v8::Integer::New(isolate, 0));
+    wwt->Set(env->buffer_string(), v8::Null(isolate));
+    // Slot for a completion that fires before JS attaches `oncomplete`; see
+    // ReportWritesToJSStreamListener::OnStreamAfterReqFinished().
+    wwt->Set(env->write_status_string(), v8::Null(isolate));
+    ww->Inherit(AsyncWrap::GetConstructorTemplate(env));
+    ww->SetClassName(FIXED_ONE_BYTE_STRING(isolate, "WriteWrap"));
+    env->set_write_wrap_template(ww);
+  }
+  SetConstructorFunction(
+      context, target, "WriteWrap", ww, SetConstructorFunctionFlag::NONE);
 
   NODE_DEFINE_CONSTANT(target, kReadBytesOrError);
   NODE_DEFINE_CONSTANT(target, kArrayBufferOffset);
   NODE_DEFINE_CONSTANT(target, kBytesWritten);
   NODE_DEFINE_CONSTANT(target, kLastWriteWasAsync);
-  target->Set(context, FIXED_ONE_BYTE_STRING(env->isolate(), "streamBaseState"),
-              env->stream_base_state().GetJSArray()).Check();
+  NODE_DEFINE_CONSTANT(target, kLastWriteErr);
+  target
+      ->Set(context,
+            FIXED_ONE_BYTE_STRING(isolate, "streamBaseState"),
+            env->stream_base_state().GetJSArray())
+      .Check();
 }
 
 void LibuvStreamWrap::RegisterExternalReferences(
@@ -134,23 +158,23 @@ Local<FunctionTemplate> LibuvStreamWrap::GetConstructorTemplate(
     Environment* env) {
   Local<FunctionTemplate> tmpl = env->libuv_stream_wrap_ctor_template();
   if (tmpl.IsEmpty()) {
-    tmpl = env->NewFunctionTemplate(nullptr);
-    tmpl->SetClassName(
-        FIXED_ONE_BYTE_STRING(env->isolate(), "LibuvStreamWrap"));
+    Isolate* isolate = env->isolate();
+    tmpl = NewFunctionTemplate(isolate, nullptr);
+    tmpl->SetClassName(FIXED_ONE_BYTE_STRING(isolate, "LibuvStreamWrap"));
     tmpl->Inherit(HandleWrap::GetConstructorTemplate(env));
     tmpl->InstanceTemplate()->SetInternalFieldCount(
-        StreamBase::kInternalFieldCount);
+        LibuvStreamWrap::kInternalFieldCount);
     Local<FunctionTemplate> get_write_queue_size =
-        FunctionTemplate::New(env->isolate(),
+        FunctionTemplate::New(isolate,
                               GetWriteQueueSize,
                               Local<Value>(),
-                              Signature::New(env->isolate(), tmpl));
+                              Signature::New(isolate, tmpl));
     tmpl->PrototypeTemplate()->SetAccessorProperty(
         env->write_queue_size_string(),
         get_write_queue_size,
         Local<FunctionTemplate>(),
         static_cast<PropertyAttribute>(ReadOnly | DontDelete));
-    env->SetProtoMethod(tmpl, "setBlocking", SetBlocking);
+    SetProtoMethod(isolate, tmpl, "setBlocking", SetBlocking);
     StreamBase::AddMethods(env, tmpl);
     env->set_libuv_stream_wrap_ctor_template(tmpl);
   }
@@ -164,6 +188,9 @@ LibuvStreamWrap* LibuvStreamWrap::From(Environment* env, Local<Object> object) {
   return Unwrap<LibuvStreamWrap>(object);
 }
 
+bool LibuvStreamWrap::IsProcessStdioOrIPCChannel(Environment* env, int fd) {
+  return fd >= 0 && (fd <= 2 || fd == env->ipc_channel_fd());
+}
 
 int LibuvStreamWrap::GetFD() {
 #ifdef _WIN32
@@ -225,19 +252,17 @@ void LibuvStreamWrap::OnUvAlloc(size_t suggested_size, uv_buf_t* buf) {
 }
 
 template <class WrapType>
+  requires(std::derived_from<WrapType, LibuvStreamWrap> ||
+           std::derived_from<WrapType, UDPWrap>)
 static MaybeLocal<Object> AcceptHandle(Environment* env,
                                        LibuvStreamWrap* parent) {
-  static_assert(std::is_base_of<LibuvStreamWrap, WrapType>::value ||
-                std::is_base_of<UDPWrap, WrapType>::value,
-                "Can only accept stream handles");
-
   EscapableHandleScope scope(env->isolate());
   Local<Object> wrap_obj;
 
   if (!WrapType::Instantiate(env, parent, WrapType::SOCKET).ToLocal(&wrap_obj))
     return Local<Object>();
 
-  HandleWrap* wrap = Unwrap<HandleWrap>(wrap_obj);
+  HandleWrap* wrap = BaseObject::Unwrap<HandleWrap>(wrap_obj);
   CHECK_NOT_NULL(wrap);
   uv_stream_t* stream = reinterpret_cast<uv_stream_t*>(wrap->GetHandle());
   CHECK_NOT_NULL(stream);
@@ -308,7 +333,7 @@ void LibuvStreamWrap::GetWriteQueueSize(
 
 void LibuvStreamWrap::SetBlocking(const FunctionCallbackInfo<Value>& args) {
   LibuvStreamWrap* wrap;
-  ASSIGN_OR_RETURN_UNWRAP(&wrap, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&wrap, args.This());
 
   CHECK_GT(args.Length(), 0);
   if (!wrap->IsAlive())
@@ -412,7 +437,7 @@ void LibuvStreamWrap::AfterUvWrite(uv_write_t* req, int status) {
 
 }  // namespace node
 
-NODE_MODULE_CONTEXT_AWARE_INTERNAL(stream_wrap,
-                                   node::LibuvStreamWrap::Initialize)
-NODE_MODULE_EXTERNAL_REFERENCE(
+NODE_BINDING_CONTEXT_AWARE_INTERNAL(stream_wrap,
+                                    node::LibuvStreamWrap::Initialize)
+NODE_BINDING_EXTERNAL_REFERENCE(
     stream_wrap, node::LibuvStreamWrap::RegisterExternalReferences)
